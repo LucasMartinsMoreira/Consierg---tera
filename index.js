@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS sessions (
  context TEXT NOT NULL DEFAULT '',
  intent_status TEXT NOT NULL DEFAULT 'diagnosis',
  turn_count INTEGER NOT NULL DEFAULT 0,
+ qualifiers_json TEXT NOT NULL DEFAULT '{}',
+ qualifier_step INTEGER NOT NULL DEFAULT 0,
  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -49,20 +51,28 @@ CREATE TABLE IF NOT EXISTS processed_updates (
  received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 `)
+try {
+ db.exec("ALTER TABLE sessions ADD COLUMN qualifiers_json TEXT NOT NULL DEFAULT '{}';")
+} catch {}
+try {
+ db.exec("ALTER TABLE sessions ADD COLUMN qualifier_step INTEGER NOT NULL DEFAULT 0;")
+} catch {}
 
 const upsertSessionStmt = db.prepare(`
-INSERT INTO sessions (chat_id, context, intent_status, turn_count, updated_at)
-VALUES (@chat_id, @context, @intent_status, @turn_count, CURRENT_TIMESTAMP)
+INSERT INTO sessions (chat_id, context, intent_status, turn_count, qualifiers_json, qualifier_step, updated_at)
+VALUES (@chat_id, @context, @intent_status, @turn_count, @qualifiers_json, @qualifier_step, CURRENT_TIMESTAMP)
 ON CONFLICT(chat_id) DO UPDATE SET
  context = excluded.context,
  intent_status = excluded.intent_status,
  turn_count = excluded.turn_count,
+ qualifiers_json = excluded.qualifiers_json,
+ qualifier_step = excluded.qualifier_step,
  updated_at = CURRENT_TIMESTAMP;
 `)
 
 function getSession(chatId) {
  const row = db
-  .prepare("SELECT chat_id, context, intent_status, turn_count FROM sessions WHERE chat_id = ?")
+  .prepare("SELECT chat_id, context, intent_status, turn_count, qualifiers_json, qualifier_step FROM sessions WHERE chat_id = ?")
   .get(String(chatId))
 
  if (row) return row
@@ -71,7 +81,9 @@ function getSession(chatId) {
   chat_id: String(chatId),
   context: "",
   intent_status: "diagnosis",
-  turn_count: 0
+  turn_count: 0,
+  qualifiers_json: "{}",
+  qualifier_step: 0
  }
 
  upsertSessionStmt.run(session)
@@ -83,7 +95,9 @@ function saveSession(session) {
   chat_id: String(session.chat_id),
   context: session.context || "",
   intent_status: session.intent_status || "diagnosis",
-  turn_count: Number(session.turn_count || 0)
+  turn_count: Number(session.turn_count || 0),
+  qualifiers_json: session.qualifiers_json || "{}",
+  qualifier_step: Number(session.qualifier_step || 0)
  })
 }
 
@@ -126,6 +140,66 @@ function isWebhookValid(req) {
  if (!TELEGRAM_WEBHOOK_SECRET) return true
  const token = req.headers["x-telegram-bot-api-secret-token"]
  return token === TELEGRAM_WEBHOOK_SECRET
+}
+
+const SALES_QUESTIONS = [
+ { key: "budget", question: "Perfeito. Qual seu teto de investimento? Ex: ate R$ 3.000." },
+ { key: "primary_use", question: "Top. Seu foco e camera, jogos, trabalho ou uso geral?" },
+ { key: "battery_need", question: "Voce precisa de bateria para o dia todo pesado? (sim/nao)" },
+ { key: "storage", question: "Quanto armazenamento voce quer? 128, 256, 512 ou 1TB?" }
+]
+
+function parseQualifiers(raw) {
+ try {
+  const parsed = JSON.parse(raw || "{}")
+  return typeof parsed === "object" && parsed ? parsed : {}
+ } catch {
+  return {}
+ }
+}
+
+function parseQualifierAnswer(key, message) {
+ const text = (message || "").trim()
+ const lower = text.toLowerCase()
+ if (!text) return null
+
+ if (key === "budget") {
+  const digits = lower.replace(/[^\d]/g, "")
+  if (!digits) return null
+  return `R$ ${Number(digits).toLocaleString("pt-BR")}`
+ }
+
+ if (key === "primary_use") {
+  if (/(camera|foto|video)/.test(lower)) return "camera"
+  if (/(jogo|games|fps)/.test(lower)) return "jogos"
+  if (/(trabalho|produtividade|office)/.test(lower)) return "trabalho"
+  return "uso geral"
+ }
+
+ if (key === "battery_need") {
+  if (/(sim|muito|bastante)/.test(lower)) return "alta"
+  if (/(nao|não|normal)/.test(lower)) return "normal"
+  return null
+ }
+
+ if (key === "storage") {
+  if (/(1tb|1024)/.test(lower)) return "1TB"
+  if (/(512)/.test(lower)) return "512GB"
+  if (/(256)/.test(lower)) return "256GB"
+  if (/(128)/.test(lower)) return "128GB"
+  return null
+ }
+
+ return null
+}
+
+function qualifiersToContext(qualifiers) {
+ return [
+  `orcamento: ${qualifiers.budget || "nao informado"}`,
+  `uso principal: ${qualifiers.primary_use || "nao informado"}`,
+  `bateria: ${qualifiers.battery_need || "nao informado"}`,
+  `armazenamento: ${qualifiers.storage || "nao informado"}`
+ ].join(", ")
 }
 
 /*
@@ -225,6 +299,8 @@ PROMPT CONCIERGE
 const conciergePrompt = `
 Voce e um concierge especialista em smartphones no tom de vendedor premium.
 Seja curto, pratico e direto. Maximo de 4 linhas na resposta ao usuario.
+Fale como vendedor humano, sem texto tecnico desnecessario.
+Sempre confirme o criterio principal do cliente antes de fechar recomendacao.
 
 Antes de recomendar produtos, faça perguntas sobre:
 
@@ -375,6 +451,36 @@ app.post("/webhook",async(req,res)=>{
   session.context = appendContext(session.context, message)
 
   session.turn_count++
+  session.qualifiers_json = session.qualifiers_json || "{}"
+  session.qualifier_step = Number(session.qualifier_step || 0)
+
+  if (session.intent_status === "diagnosis" && session.qualifier_step < SALES_QUESTIONS.length) {
+   const qualifiers = parseQualifiers(session.qualifiers_json)
+   const currentQuestion = SALES_QUESTIONS[session.qualifier_step]
+   const parsedAnswer = parseQualifierAnswer(currentQuestion.key, message)
+
+   if (session.turn_count === 1 && !parsedAnswer) {
+    await sendTelegram(chatId, "Fechado. Vou te achar a melhor oferta com 4 perguntas rapidas.")
+    await sendTelegram(chatId, SALES_QUESTIONS[0].question)
+    saveSession(session)
+    return res.sendStatus(200)
+   }
+
+   if (parsedAnswer) {
+    qualifiers[currentQuestion.key] = parsedAnswer
+    session.qualifier_step += 1
+    session.qualifiers_json = JSON.stringify(qualifiers)
+   }
+
+   if (session.qualifier_step < SALES_QUESTIONS.length) {
+    await sendTelegram(chatId, SALES_QUESTIONS[session.qualifier_step].question)
+    saveSession(session)
+    return res.sendStatus(200)
+   }
+
+   session.intent_status = "searching"
+   session.context = appendContext(session.context, `perfil qualificado: ${qualifiersToContext(qualifiers)}`)
+  }
 
   let phones=[]
 
@@ -384,6 +490,12 @@ app.post("/webhook",async(req,res)=>{
 
    phones=await searchPhones(query)
    savePriceSnapshot(chatId, query, phones)
+   if (!phones.length) {
+    session.intent_status = "diagnosis"
+    saveSession(session)
+    await sendTelegram(chatId, "Nao achei oferta forte agora. Me passe faixa de preco e prioridade em 1 frase.")
+    return res.sendStatus(200)
+   }
 
   }
 

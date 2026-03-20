@@ -4,6 +4,10 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "start": "node index.js",
+    "concierge:ligar": "powershell -ExecutionPolicy Bypass -File ./ops/concierge-control.ps1 ligar",
+    "concierge:desligar": "powershell -ExecutionPolicy Bypass -File ./ops/concierge-control.ps1 desligar",
+    "concierge:status": "powershell -ExecutionPolicy Bypass -File ./ops/concierge-control.ps1 status",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
