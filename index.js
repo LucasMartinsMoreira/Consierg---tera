@@ -5,8 +5,8 @@ const { randomUUID } = require("crypto")
 const express = require("express")
 const axios = require("axios")
 const OpenAI = require("openai")
-const Database = require("better-sqlite3")
 const cron = require("node-cron")
+const db = require("./lib/db")
 
 const app = express()
 app.use(express.json({ limit: "256kb" }))
@@ -16,6 +16,7 @@ const SERPAPI_KEY = process.env.SERPAPI_KEY
 const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || ""
 const LOG_VIEWER_SECRET = process.env.LOG_VIEWER_SECRET || ""
 const PORT = Number(process.env.PORT || 3000)
+const OPENAI_MODEL = String(process.env.OPENAI_MODEL || "gpt-4.1-mini").trim() || "gpt-4.1-mini"
 const MAX_CONTEXT_CHARS = 6000
 const TELEGRAM_LOG_MAX = 500
 const telegramMessageLog = []
@@ -48,14 +49,14 @@ function formatLogPage(logs) {
       .join("")
  const keyHint = LOG_VIEWER_SECRET
   ? `<p class="hint">Acesso protegido: abra com <code>?key=SUA_CHAVE</code> (LOG_VIEWER_SECRET no .env).</p>`
-  : `<p class="hint">Sem senha: em produção, defina <code>LOG_VIEWER_SECRET</code> no .env.</p>`
+  : `<p class="hint">Sem senha: em produÃ§Ã£o, defina <code>LOG_VIEWER_SECRET</code> no .env.</p>`
  return `<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <meta http-equiv="refresh" content="4"/>
-<title>Concierge — log Telegram</title>
+<title>Concierge â€” log Telegram</title>
 <style>
  body{font-family:system-ui,sans-serif;background:#0f1419;color:#e7e9ea;margin:0;padding:1rem;}
  h1{font-size:1.1rem;font-weight:600;}
@@ -69,8 +70,8 @@ function formatLogPage(logs) {
 </style>
 </head>
 <body>
-<h1>Mensagens Telegram (últimas ${logs.length})</h1>
-<p class="hint">Atualiza a cada 4s. Entrada = usuário; Saída = texto enviado pelo bot.</p>
+<h1>Mensagens Telegram (Ãºltimas ${logs.length})</h1>
+<p class="hint">Atualiza a cada 4s. Entrada = usuÃ¡rio; SaÃ­da = texto enviado pelo bot.</p>
 ${keyHint}
 <table>
 <thead><tr><th>Hora (SP)</th><th>chat_id</th><th>Dir</th><th>Texto</th><th>Nota</th></tr></thead>
@@ -81,162 +82,86 @@ ${keyHint}
 }
 
 const openai = new OpenAI({
- apiKey: process.env.OPENAI_API_KEY
+ apiKey: process.env.OPENAI_API_KEY,
+ ...(process.env.OPENAI_PROJECT_ID
+  ? { defaultHeaders: { "OpenAI-Project": process.env.OPENAI_PROJECT_ID } }
+  : {})
 })
+
+/** Armazena respostas na OpenAI (metadados no projeto). Defina OPENAI_STORE_COMPLETIONS=1 no .env. */
+const OPENAI_STORE_COMPLETIONS = /^1|true|yes$/i.test(
+ String(process.env.OPENAI_STORE_COMPLETIONS || "")
+)
+
+function openaiTraceLine(fields) {
+ const parts = Object.entries(fields).map(([k, v]) => `${k}=${v}`)
+ console.log(`[openai] ${parts.join(" ")}`)
+}
+
+/** Texto agregado da Responses API (fallback se output_text vier vazio). */
+function responsesOutputText(response) {
+ const direct = String(response.output_text || "").trim()
+ if (direct) return response.output_text
+ const items = response.output || []
+ for (const item of items) {
+  if (item.type !== "message" || !item.content) continue
+  const texts = []
+  for (const part of item.content) {
+   if (part.type === "output_text" && part.text) texts.push(part.text)
+  }
+  if (texts.length) return texts.join("")
+ }
+ return ""
+}
+
+/**
+ * Responses API (recomendada pela OpenAI em relaÃ§Ã£o a Chat Completions).
+ * @see https://developers.openai.com/api/docs/guides/migrate-to-responses
+ *
+ * body: { model, messages, response_format?: { type: 'json_object' } }
+ */
+async function createOpenAIResponse(body, ctx) {
+ const clientRequestId = randomUUID()
+ const headers = { "X-Client-Request-Id": clientRequestId }
+ const { model, messages, response_format, ...rest } = body
+ const req = {
+  model: model || OPENAI_MODEL,
+  input: messages,
+  ...rest
+ }
+ if (response_format && response_format.type === "json_object") {
+  req.text = { format: { type: "json_object" } }
+ }
+ if (OPENAI_STORE_COMPLETIONS) {
+  const meta = {
+   app: "concierge-bot",
+   step: String(ctx.step || "call").slice(0, 64)
+  }
+  if (ctx.chatId) meta.chat_id = String(ctx.chatId).slice(0, 512)
+  if (ctx.conversationId) meta.conv = String(ctx.conversationId).slice(0, 512)
+  req.store = true
+  req.metadata = meta
+ }
+ const response = await openai.responses.create(req, { headers })
+ openaiTraceLine({
+  step: ctx.step,
+  client_request_id: clientRequestId,
+  x_request_id: response._request_id || "",
+  response_id: response.id,
+  chat_id: ctx.chatId || "-"
+ })
+ return response
+}
 
 const http = axios.create({
  timeout: 15000
 })
 
-const db = new Database(path.join(__dirname, "concierge.db"))
-db.pragma("journal_mode = WAL")
-db.exec(`
-CREATE TABLE IF NOT EXISTS sessions (
- chat_id TEXT PRIMARY KEY,
- conversation_id TEXT NOT NULL,
- context TEXT NOT NULL DEFAULT '',
- intent_status TEXT NOT NULL DEFAULT 'diagnosis',
- turn_count INTEGER NOT NULL DEFAULT 0,
- qualifiers_json TEXT NOT NULL DEFAULT '{}',
- qualifier_step INTEGER NOT NULL DEFAULT 0,
- operation_mode TEXT NOT NULL DEFAULT 'recommend',
- monitor_target_brl REAL,
- monitor_alert_sent_on TEXT,
- updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
+// Inicializa tabelas no Postgres na primeira chamada (lazy via lib/db.js)
 
-CREATE TABLE IF NOT EXISTS price_history (
- id INTEGER PRIMARY KEY AUTOINCREMENT,
- chat_id TEXT NOT NULL,
- query TEXT NOT NULL,
- model TEXT NOT NULL,
- price TEXT,
- price_numeric REAL,
- store TEXT,
- product_url TEXT,
- rank_score REAL,
- rank_reason TEXT,
- source_engine TEXT NOT NULL DEFAULT 'serpapi_google_shopping',
- captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS processed_updates (
- update_id INTEGER PRIMARY KEY,
- received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-`)
-try {
- db.exec("ALTER TABLE sessions ADD COLUMN qualifiers_json TEXT NOT NULL DEFAULT '{}';")
-} catch {}
-try {
- db.exec("ALTER TABLE sessions ADD COLUMN qualifier_step INTEGER NOT NULL DEFAULT 0;")
-} catch {}
-try {
- db.exec("ALTER TABLE sessions ADD COLUMN conversation_id TEXT;")
-} catch {}
-try {
- db.exec("ALTER TABLE sessions ADD COLUMN operation_mode TEXT NOT NULL DEFAULT 'recommend';")
-} catch {}
-try {
- db.exec("ALTER TABLE sessions ADD COLUMN monitor_target_brl REAL;")
-} catch {}
-try {
- db.exec("ALTER TABLE sessions ADD COLUMN monitor_alert_sent_on TEXT;")
-} catch {}
-
-try {
- db.exec("ALTER TABLE price_history ADD COLUMN price_numeric REAL;")
-} catch {}
-try {
- db.exec("ALTER TABLE price_history ADD COLUMN product_url TEXT;")
-} catch {}
-try {
- db.exec("ALTER TABLE price_history ADD COLUMN rank_score REAL;")
-} catch {}
-try {
- db.exec("ALTER TABLE price_history ADD COLUMN rank_reason TEXT;")
-} catch {}
-try {
- db.exec("ALTER TABLE price_history ADD COLUMN source_engine TEXT DEFAULT 'serpapi_google_shopping';")
-} catch {}
-try {
- db.exec("ALTER TABLE sessions ADD COLUMN resume_checkpoint_json TEXT NOT NULL DEFAULT '';")
-} catch {}
-
-const upsertSessionStmt = db.prepare(`
-INSERT INTO sessions (chat_id, conversation_id, context, intent_status, turn_count, qualifiers_json, qualifier_step, operation_mode, monitor_target_brl, monitor_alert_sent_on, resume_checkpoint_json, updated_at)
-VALUES (@chat_id, @conversation_id, @context, @intent_status, @turn_count, @qualifiers_json, @qualifier_step, @operation_mode, @monitor_target_brl, @monitor_alert_sent_on, @resume_checkpoint_json, CURRENT_TIMESTAMP)
-ON CONFLICT(chat_id) DO UPDATE SET
- conversation_id = COALESCE(NULLIF(excluded.conversation_id, ''), sessions.conversation_id),
- context = excluded.context,
- intent_status = excluded.intent_status,
- turn_count = excluded.turn_count,
- qualifiers_json = excluded.qualifiers_json,
- qualifier_step = excluded.qualifier_step,
- operation_mode = excluded.operation_mode,
- monitor_target_brl = excluded.monitor_target_brl,
- monitor_alert_sent_on = excluded.monitor_alert_sent_on,
- resume_checkpoint_json = excluded.resume_checkpoint_json,
- updated_at = CURRENT_TIMESTAMP;
-`)
-
-function getSession(chatId) {
- const row = db
-  .prepare("SELECT chat_id, conversation_id, context, intent_status, turn_count, qualifiers_json, qualifier_step, operation_mode, monitor_target_brl, monitor_alert_sent_on, resume_checkpoint_json FROM sessions WHERE chat_id = ?")
-  .get(String(chatId))
-
- if (row) {
-  if (!row.conversation_id) {
-   const id = randomUUID()
-   db.prepare("UPDATE sessions SET conversation_id = ? WHERE chat_id = ?").run(id, String(chatId))
-   row.conversation_id = id
-  }
-  row.operation_mode = row.operation_mode || "recommend"
-  row.monitor_target_brl =
-   row.monitor_target_brl === null || row.monitor_target_brl === undefined
-    ? null
-    : Number(row.monitor_target_brl)
-  row.monitor_alert_sent_on = row.monitor_alert_sent_on ?? null
-  row.resume_checkpoint_json = row.resume_checkpoint_json || ""
-  return row
- }
-
- const session = {
-  chat_id: String(chatId),
-  conversation_id: randomUUID(),
-  context: "",
-  intent_status: "diagnosis",
-  turn_count: 0,
-  qualifiers_json: "{}",
-  qualifier_step: 0,
-  operation_mode: "recommend",
-  monitor_target_brl: null,
-  monitor_alert_sent_on: null,
-  resume_checkpoint_json: ""
- }
-
- upsertSessionStmt.run(session)
- return session
-}
-
-function saveSession(session) {
- upsertSessionStmt.run({
-  chat_id: String(session.chat_id),
-  conversation_id: session.conversation_id || randomUUID(),
-  context: session.context || "",
-  intent_status: session.intent_status || "diagnosis",
-  turn_count: Number(session.turn_count || 0),
-  qualifiers_json: session.qualifiers_json || "{}",
-  qualifier_step: Number(session.qualifier_step || 0),
-  operation_mode: session.operation_mode === "monitor" ? "monitor" : "recommend",
-  monitor_target_brl:
-   session.monitor_target_brl === null || session.monitor_target_brl === undefined
-    ? null
-    : Number(session.monitor_target_brl),
-  monitor_alert_sent_on: session.monitor_alert_sent_on || null,
-  resume_checkpoint_json: session.resume_checkpoint_json || ""
- })
-}
+// getSession e saveSession delegam para lib/db.js (async/PostgreSQL)
+const getSession = db.getSession.bind(db)
+const saveSession = db.saveSession.bind(db)
 
 const TRUSTED_STORE_HINTS = [
  "amazon",
@@ -312,7 +237,7 @@ function rankAndEnrichPhones(phones, qualifiers) {
   const storM = storageHintMatch(p.model, q)
   const score = pricePart + trust + storM
   const reasons = []
-  if (p.price_numeric) reasons.push(`preço relativo ${pricePart.toFixed(0)}/35`)
+  if (p.price_numeric) reasons.push(`preÃ§o relativo ${pricePart.toFixed(0)}/35`)
   if (trust) reasons.push(`loja +${trust}`)
   if (storM > 2) reasons.push(`armazenamento +${storM}`)
   return {
@@ -327,23 +252,23 @@ function rankAndEnrichPhones(phones, qualifiers) {
 function detectOperationMode(message, currentMode) {
  const l = (message || "").toLowerCase()
  if (
-  /monitor|acompanh|alerta|avisar|avis(o|e)|pre[cç]o alvo|preco-alvo|esperar cair|queda de pre/.test(l)
+  /monitor|acompanh|alerta|avisar|avis(o|e)|pre[cÃ§]o alvo|preco-alvo|esperar cair|queda de pre/.test(l)
  )
   return "monitor"
- if (/comprar agora|recomend|melhor op|qual (comprar|pego)|sugest(a|ão)/.test(l)) return "recommend"
+ if (/comprar agora|recomend|melhor op|qual (comprar|pego)|sugest(a|Ã£o)/.test(l)) return "recommend"
  return currentMode === "monitor" ? "monitor" : currentMode === "recommend" ? "recommend" : "recommend"
 }
 
 function parseMonitorTargetBrl(message) {
  const raw = message || ""
  const m = raw.match(
-  /(?:alvo|ate|até|m[aá]ximo|teto|m[aá]x)\s*[:\s]*R?\$?\s*([\d]{1,3}(?:\.[\d]{3})*(?:,[\d]{2})?|[\d]+(?:,[\d]{2})?)/i
+  /(?:alvo|ate|atÃ©|m[aÃ¡]ximo|teto|m[aÃ¡]x)\s*[:\s]*R?\$?\s*([\d]{1,3}(?:\.[\d]{3})*(?:,[\d]{2})?|[\d]+(?:,[\d]{2})?)/i
  )
  if (m) {
   const n = parseBrlPriceString(m[1])
   if (n && n > 0) return n
  }
- if (/monitor|alvo|pre[cç]o|preco|acompanh/i.test(raw)) {
+ if (/monitor|alvo|pre[cÃ§]o|preco|acompanh/i.test(raw)) {
   const d = raw.match(/\b(\d{3,5})\b/)
   if (d) {
    const n = Number(d[1])
@@ -357,44 +282,9 @@ function todayKeySaoPaulo() {
  return new Date().toLocaleDateString("en-CA", { timeZone: "America/Sao_Paulo" })
 }
 
-function markUpdateProcessed(updateId) {
- if (typeof updateId !== "number") return false
- try {
-  db.prepare("INSERT INTO processed_updates (update_id) VALUES (?)").run(updateId)
-  return false
- } catch {
-  return true
- }
-}
-
-function savePriceSnapshot(chatId, query, phones) {
- if (!phones.length) return
- const insert = db.prepare(`
-INSERT INTO price_history (chat_id, query, model, price, price_numeric, store, product_url, rank_score, rank_reason, source_engine)
-VALUES (@chat_id, @query, @model, @price, @price_numeric, @store, @product_url, @rank_score, @rank_reason, @source_engine)
-`)
- const tx = db.transaction((items) => {
-  for (const item of items) {
-   const priceNum =
-    item.price_numeric !== null && item.price_numeric !== undefined
-     ? item.price_numeric
-     : parseBrlPriceString(item.price)
-   insert.run({
-    chat_id: String(chatId),
-    query,
-    model: item.model || "Modelo nao informado",
-    price: item.price || "",
-    price_numeric: priceNum,
-    store: item.store || "",
-    product_url: item.link || null,
-    rank_score: item.rank_score ?? null,
-    rank_reason: item.rank_reason || null,
-    source_engine: "serpapi_google_shopping"
-   })
-  }
- })
- tx(phones)
-}
+// markUpdateProcessed e savePriceSnapshot delegam para lib/db.js (async/PostgreSQL)
+const markUpdateProcessed = db.markUpdateProcessed.bind(db)
+const savePriceSnapshot = db.savePriceSnapshot.bind(db)
 
 function appendContext(context, message) {
  const next = `${context}\n${message}`.trim()
@@ -407,14 +297,20 @@ function isWebhookValid(req) {
  return token === TELEGRAM_WEBHOOK_SECRET
 }
 
-/** Passo “terminamos o funil” (sem perguntas fixas por indice). */
+/** Passo â€œterminamos o funilâ€ (sem perguntas fixas por indice). */
 const QUALIFIER_DONE_STEP = 99
 
 const FLEX_DIAGNOSIS_RESUME =
- "Otimo, retomando — sem pressa. O que **mais importa** pra voce nesse celular agora?"
+ "Otimo, retomando â€” sem pressa. O que **mais importa** pra voce nesse celular agora?"
 
 const FLEX_NEW_CHAT_OPENER =
- "Combinado, comecamos de novo. Me conta **com calma** o cenario: troca o que ta quebrado, upgrade, presente… o que trouxe voce aqui?"
+ "Combinado, comecamos de novo. Me conta **com calma** o cenario: troca o que ta quebrado, upgrade, presenteâ€¦ o que trouxe voce aqui?"
+
+const META_WHO_REPLY =
+ "Sou o **Concierge**: te ajudo a escolher smartphone com **custo real** e seguranÃ§a (loja confiavel, parcelas, o que importa pra voce). **Nao** sou formulario â€” manda ver o que precisa, ou diz **reiniciar** se quiser zerar o papo."
+
+const UNCERTAIN_CONCIERGE_LINE =
+ "Putz, me enrolei aqui! **Nao tenho essa informacao agora.** Vamos **retomar de onde paramos** ou prefere **resetar o papo**? (Pode escrever **reiniciar**.)"
 
 function parseQualifiers(raw) {
  try {
@@ -447,7 +343,7 @@ function extractBudgetReaisFromMessage(text) {
   const n = parseBrlPriceString(m[1])
   if (n !== null && n >= 200 && n <= 1500000) return n
  }
- const ate = lower.match(/(?:ate|até)\s+(?:uns?\s+)?(?:r\$\s*)?([\d.,]+)\s*(?:reais)?/)
+ const ate = lower.match(/(?:ate|atÃ©)\s+(?:uns?\s+)?(?:r\$\s*)?([\d.,]+)\s*(?:reais)?/)
  if (ate) {
   const n = parseBrlPriceString(ate[1])
   if (n !== null && n >= 200 && n <= 1500000) return n
@@ -473,14 +369,14 @@ function parseQualifierAnswer(key, message) {
    )
   )
    return "modelo_em_mente"
-  if (/(explorar|indica|sugere|nao sei|não sei|melhor opc|custo benef|orça|orçamento)/i.test(lower))
+  if (/(explorar|indica|sugere|nao sei|nÃ£o sei|melhor opc|custo benef|orÃ§a|orÃ§amento)/i.test(lower))
    return "explorar_opcoes"
   return "explorar_opcoes"
  }
 
  if (key === "budget") {
   if (
-   /sem limite|sem teto|flex[ií]vel|ilimitad|nao sei|não sei|nao tenho|não tenho|qualquer|tanto faz|open budget|economizar|o mais barato|^barato$/i.test(
+   /sem limite|sem teto|flex[iÃ­]vel|ilimitad|nao sei|nÃ£o sei|nao tenho|nÃ£o tenho|qualquer|tanto faz|open budget|economizar|o mais barato|^barato$/i.test(
     lower
    )
   )
@@ -512,12 +408,12 @@ function parseQualifierAnswer(key, message) {
 
  if (key === "battery_need") {
   if (
-   /(sim|muito|bastante|dia todo|o dia inteiro|o dia todo|pesad[o]|aguenta|duradour|autonomia|no m[ií]nimo|preciso.*bateria|bateria.*importante|trilha|dois dias|rolê|role)/i.test(
+   /(sim|muito|bastante|dia todo|o dia inteiro|o dia todo|pesad[o]|aguenta|duradour|autonomia|no m[iÃ­]nimo|preciso.*bateria|bateria.*importante|trilha|dois dias|rolÃª|role)/i.test(
     lower
    )
   )
    return "alta"
-  if (/(nao|não|normal|leve|moderad|basico|s[oó] redes sociais)/.test(lower)) return "normal"
+  if (/(nao|nÃ£o|normal|leve|moderad|basico|s[oÃ³] redes sociais)/.test(lower)) return "normal"
   return null
  }
 
@@ -526,7 +422,7 @@ function parseQualifierAnswer(key, message) {
   if (/(512)/.test(lower)) return "512GB"
   if (/(256)/.test(lower)) return "256GB"
   if (/(128)/.test(lower)) return "128GB"
-  if (/medio|m[eé]dia|intermedi|nao sei|não sei|tanto faz|indiferente/.test(lower)) return "256GB"
+  if (/medio|m[eÃ©]dia|intermedi|nao sei|nÃ£o sei|tanto faz|indiferente/.test(lower)) return "256GB"
   return null
  }
 
@@ -539,7 +435,7 @@ function normalizeChatTokens(s) {
   .toLowerCase()
   .normalize("NFD")
   .replace(/[\u0300-\u036f]/g, "")
-  .replace(/[!?.#,;:…]+/g, " ")
+  .replace(/[!?.#,;:â€¦]+/g, " ")
   .replace(/\s+/g, " ")
   .trim()
 }
@@ -548,7 +444,7 @@ function isCasualGreeting(text) {
  const raw = String(text || "").trim()
  if (!raw || raw.length > 120) return false
  if (
-  /(quero|preciso|comprar|or[cç]amento|orcamento|iphone|android|celular|smartphone|pixel|galaxy|xiaomi|motorola|r\$|\breais\b|\b\d{4,}\b)/i.test(
+  /(quero|preciso|comprar|or[cÃ§]amento|orcamento|iphone|android|celular|smartphone|pixel|galaxy|xiaomi|motorola|r\$|\breais\b|\b\d{4,}\b)/i.test(
    raw
   )
  )
@@ -563,14 +459,14 @@ function isCasualGreeting(text) {
  )
 }
 
-/** Saudacao / encheção curta no passo de orçamento (evita loop em "e ai beleza?"). */
+/** Saudacao / encheÃ§Ã£o curta no passo de orÃ§amento (evita loop em "e ai beleza?"). */
 function isBudgetConversationFiller(text) {
  const raw = String(text || "").trim()
  if (!raw || raw.length > 90) return false
  if (/\br\$\s*[\d.,]+/i.test(raw)) return false
  if (extractBudgetReaisFromMessage(raw) !== null) return false
  if (
-  /(quero|preciso|vou comprar|comprar um|comprar uma|iphone|galaxy|pixel|celular|smartphone|or[cç]amento|orcamento)/i.test(
+  /(quero|preciso|vou comprar|comprar um|comprar uma|iphone|galaxy|pixel|celular|smartphone|or[cÃ§]amento|orcamento)/i.test(
    raw
   )
  )
@@ -625,6 +521,7 @@ function mergeQualifiersFromPatch(qualifiers, patch, message) {
 
 function qualifiersRoughlyReadyForSearch(qualifiers, session) {
  const q = qualifiers || {}
+ const ctx = session.context || ""
  const bud = q.budget ? String(q.budget).trim() : ""
  const hasBudget = Boolean(bud)
  const hasFlex = /flexivel/i.test(bud)
@@ -632,13 +529,44 @@ function qualifiersRoughlyReadyForSearch(qualifiers, session) {
  const hasPath = Boolean(q.path_model)
  const hasUse = Boolean(q.primary_use || q.battery_need || q.storage)
  const tc = Number(session.turn_count || 0)
- const ctxLen = (session.context || "").length
+ const ctxLen = ctx.length
+ const modeloDireto =
+  /(quero (o |a )?(galaxy|iphone|pixel|redmi|poco|motorola)|\bS2[0-9]\b|iphone\s*(1[0-7]|pro|max|mini|se)|galaxy\s+[az]\s*\d|note\s*\d)/i.test(
+   ctx
+  )
+ if (modeloDireto && (hasBudget || hasFlex || tc >= 1)) return true
  if (!hasBudget) return false
  if (hasFlex && !(hasPath || hasUse) && tc < 8) return false
  if ((hasNumericBudget || hasFlex) && (hasPath || hasUse)) return true
  if ((hasNumericBudget || hasFlex) && ctxLen >= 500) return true
  if (hasBudget && tc >= 12) return true
  return false
+}
+
+/** Comandos que interrompem o fluxo: prioridade sobre diagnostico (O/C/A). */
+function parseHardInterrupt(text) {
+ const t = normalizeChatTokens(text)
+ if (!t || t.length > 120) return null
+ if (
+  /^(reiniciar|recomecar|comecar de novo|comecar do zero|zerar tudo|reset|resetar|limpar tudo|apagar tudo|nova conversa|quero recomecar|quero reiniciar)$/i.test(
+   t
+  )
+ )
+  return "restart"
+ if (
+  /^(reinicia|recomeca|zera|reseta)\b/i.test(t) &&
+  t.length < 40
+ )
+  return "restart"
+ if (/(mudar de assunto|outro assunto|esquece o que (eu )?disse|para com isso|cancela tudo)(\b|$)/i.test(t))
+  return "restart"
+ if (
+  /(quem e voce|quem es|o que voce faz|o que vc faz|pra que (voce|vc) serve|o que e (esse|o) bot|voce e (um )?bot|como (voce|vc) funciona)/i.test(
+   t
+  )
+ )
+  return "meta_who"
+ return null
 }
 
 function hasResumableConversation(session) {
@@ -719,7 +647,7 @@ function parseResumeChoice(text) {
  )
   return "new"
  if (
-  /(^|\b)(comecar\s+uma\s+nova|comecar\s+nova\b|uma\s+nova\s+conversa|so\s+nova\b|s[oó]\s+nova\b)(\b|$)/i.test(
+  /(^|\b)(comecar\s+uma\s+nova|comecar\s+nova\b|uma\s+nova\s+conversa|so\s+nova\b|s[oÃ³]\s+nova\b)(\b|$)/i.test(
    t
   )
  )
@@ -825,13 +753,15 @@ EXTRAIR QUERY DE BUSCA
 ========================================
 */
 
-async function extractSearchQuery(context){
+async function extractSearchQuery(context, traceCtx = {}) {
 
  try{
 
-  const completion = await openai.chat.completions.create({
+  const response = await createOpenAIResponse(
 
-   model:"gpt-4o-mini",
+   {
+
+   model: OPENAI_MODEL,
 
    messages:[
     {
@@ -841,7 +771,7 @@ async function extractSearchQuery(context){
     {
      role:"user",
      content:`
-Contexto do usuário:
+Contexto do usuÃ¡rio:
 
 ${context}
 
@@ -851,9 +781,11 @@ Retorne somente JSON valido: {"query":"..."}.
    ],
    response_format: { type: "json_object" }
 
-  })
+   },
+   { step: "extract_search_query", ...traceCtx }
+  )
 
-  const raw = completion.choices[0].message.content || "{}"
+  const raw = responsesOutputText(response) || "{}"
   const parsed = JSON.parse(raw)
   return (parsed.query || "").trim() || "smartphone"
 
@@ -918,94 +850,94 @@ PROMPT CONCIERGE
 */
 
 const conciergePrompt = `
-Motor do Concierge (MVP v4.0) — voce e consultor elite em smartphones: **Custo Real** (beneficio financeiro) e **Seguranca**. Tom descontraido, charmoso, direto e atento a detalhes.
+O â€” OBJETIVO: Consultor **elite** em smartphones. Sucesso = conversa **fluida**; **priorize a vontade do usuario** sobre qualquer roteiro tecnico.
 
-CANAL API (obrigatorio):
-- Responda apenas com JSON valido: user_message, user_profile, top_recommendations, intent_status, turn_count.
-- O usuario ve **somente** user_message: texto natural para Telegram, sem JSON, sem blocos de codigo, sem crases.
-- Em user_message use **negrito** (asteriscos duplos) em nomes de aparelhos e precos; use linhas com • ou - para pros e contras quando fizer comparativo.
-- Se ja existirem produtos na lista, NAO cole URLs em user_message (o sistema manda links em outra mensagem). Mantenha user_message ate ~8 linhas quando houver comparativo.
+C â€” CONTEXTO: Guia **proativo**, nao formulario. Se o usuario mudar de assunto ou pedir para recomecar, o fluxo ja pode ter sido tratado â€” aqui continue **ouvindo** e respondendo a ultima mensagem de verdade.
 
-O — Objetivo: recomendacao tecnicamente forte, financeiramente otimizada e segura.
+CANAL API:
+- Responda so JSON: user_message, user_profile, top_recommendations, intent_status, turn_count.
+- user_message = **texto natural** para Telegram (sem JSON, sem codigo). **Negrito** em aparelhos e precos; bullets para pros/contras.
+- Sem URLs na user_message se ja houver produtos na lista (o app envia links a parte).
 
-C — Contexto: nao somos comparador passivo. Antecipe frete, parcelas sem juros, cashback (Méliuz / Inter / Cuponomia quando fizer sentido), reputacao (Reclame Aqui / entregas) — use linguagem de alerta honesta; no MVP os dados de loja vêm da busca, entao cite como verificacao manual se nao tiver nota.
+A â€” ACOES:
+- Se se perder ou for tema fora do escopo: algo como "**Putz, me enrolei aqui!** Nao tenho essa informacao agora. Vamos **retomar** ou **resetar o papo**?"
+- **Custo e seguranca**: Ã  vista vs parcelado sem juros quando der; cashback/frete quando fizer sentido; **Reclame Aqui** / reputacao das lojas (MVP: validar na pratica se nao tiver nota na lista).
+- Comparativo: pro/contra em bateria real, camera, performance.
 
-A — Acoes:
-- Tom: **conversa de bar / consultor de confianca** — respire, ouça, reformule o que entendeu antes de puxar preco. Nao atropele o usuario.
-- Diagnostico: use o historico; **uma** duvida ou reflexao por mensagem quando precisar; evite checklist e frases de call center.
-- Custo total: compare a vista vs parcelado sem juros quando os precos da lista permitirem inferir (ex.: "10x de R$ X").
-- Versus: quando sugerir 2 opcoes, pro/contra focando bateria real, camera, processamento.
-- Se turn_count > 10 e intent_status ainda diagnosis, ou se o usuario repete duvida, sugira gentilmente: "Parece que estamos em duvida! Quer **recomecar do zero** ou prefere que eu chame a **Nathalia** (minha criadora humana) pra dar um pitaco aqui?"
+N â€” NORMAS:
+- **Antigolpe**: lojas oficiais e grandes varejistas (Amazon BR, Magalu, Mercado Livre, Casas Bahia, KaBuM, Fast Shop, Ponto, etc.). Marketplace so se for logica de fabricante.
+- Se **3 impasses** seguidos (sem avanco), sugira a **Nathalia** (criadora humana) com simpatia.
 
-N — Normas:
-- Antigolpe: prefira lojas conhecidas (Amazon BR, ML, Magalu, Casas Bahia, KaBuM, Fast Shop, Ponto, oficiais). Marketplace so fabricante. Desconfie de preco irreais.
-- Transparente: se a vista for pior mas parcelas sem juros mudam o jogo, diga isso.
-- Fora de tema smartphone: recuse com charme breve.
+S â€” SAIDA: charmoso, direto. **Nunca** ignore uma frase do usuario para forcar pergunta de diagnostico.
 
-E — Estilo de exemplo (nao copie literal): comparar duas lojas com parcelas, frete e nota; pro/contra curtos.
+Modo operation_mode: recommend | monitor (rotina de precos; sem prometer compra automatica).
 
-Modo sessao (operation_mode): recommend (fechar melhor opcao) ou monitor (rotina de precos, alvo — nao prometa compra automatica).
-
-intent_status: diagnosis enquanto falta criterio; searching quando for buscar/ofertas; options_given quando listou opcoes fortes.
+intent_status: diagnosis | searching | options_given como ja definido.
 `
 
 const diagnosisExtractPrompt = `
-Voce **conduz** a conversa para entender o que a pessoa quer de verdade — nao e questionario, nem suporte nivel 1.
+O â€” OBJETIVO: Mesmo do Concierge â€” conversa fluida; **priorize o pedido atual** do usuario, nao um script.
 
-REGRAS DE OURO:
-1) **Espelhe** o que a pessoa disse (meia frase bastante) antes de perguntar outra coisa — ela precisa sentir que foi ouvida.
-2) Tom brasileiro, **mate a formalidade**: pode ser "beleza", "entendi", "faz sentido", mas sem ser brega.
-3) **No maximo UMA** curiosidade nova por resposta — ou nenhuma, se ela ainda esta se abrindo. Nada de 3 perguntas em sequencia.
-4) Proibido: listas numeradas de opcoes, "escolha A/B/C", "digite X", bloco de FAQ, tom de bot.
-5) Se o usuario so cumprimentou ou esta vago, **convoque** ele com leveza (troca, problema com o celular atual, sonho de aparelho) — nao exija orcamento ja de cara.
-6) **Prioridade "diagnosis"**: fique conversando ate ter **orcamento (ou flexivel) + alguma direcao** (modelo, uso, prioridade) OU muita conversa acumulada. Nao corra para "buscar ofertas".
+C â€” CONTEXTO: **Nao e formulario.** Comandos tipo "reiniciar" ou "quem e voce?" o backend pode tratar antes; se a mensagem ainda for sobre isso, responda **humanamente** e convide a seguir.
 
-qualifiers_patch (só trechos evidentes no que ela falou — pode ser {} vazio):
+A â€” ACOES:
+1) **Escuta ativa (prioridade 1):** **Nunca ignore** o que a pessoa disse so para encaixar pergunta de diagnostico â€” cite ou responda primeiro.
+2) **Diagnostico adaptativo:** vago ("quero um celular") â†’ estilo de vida, curiosidade leve. **Direto** ("quero o S23") â†’ menos rodeio; caminhe para **analise de custo e seguranca** (intent "searching" quando ja der pra buscar ofertas).
+3) **Desconhecimento / fora do escopo:** use ideia de: "${UNCERTAIN_CONCIERGE_LINE}" (pode variar o texto, mantenha o tom).
+4) Se **impasse_rodadas** no payload for >= 3: inclua oferta gentil de falar com a **Nathalia** (criadora).
+
+qualifiers_patch (so o explicito na mensagem/historico):
 - path_model: "modelo_em_mente" | "explorar_opcoes"
 - budget: "R$ ..." ou "flexivel"
-- primary_use, battery_need, storage: como ja definido no sistema
+- primary_use, battery_need, storage (valores do sistema)
 
-intent_status:
-- "diagnosis" — quase sempre.
-- "searching" — **só** se ela deixou claro que quer ver precos/opcoes *agora* e o contexto ja tem orcamento ou flexivel **e** direcao de uso/modelo (ou conversa longa o bastante). Na duvida, "diagnosis".
+intent_status: "diagnosis" na duvida. "searching" se usuario **direto** com modelo claro ou contexto ja fechado para buscar ofertas.
 
-JSON estrito: {"user_message":"...","qualifiers_patch":{},"intent_status":"diagnosis"|"searching"}
+JSON: {"user_message":"...","qualifiers_patch":{},"intent_status":"diagnosis"|"searching"}
 `
 
 function diagnosisStageHint(turnCount) {
  const tc = Number(turnCount || 0)
  if (tc <= 2)
-  return "Estagio: inicio — conheça a pessoa; nao cobre teto de preco se ela só entrou no assunto."
+  return "Estagio: inicio â€” conheÃ§a a pessoa; nao cobre teto de preco se ela sÃ³ entrou no assunto."
  if (tc <= 6)
-  return "Estagio: meio — aprofunde uso real (foto, bateria, trabalho, jogo) com naturalidade."
- return "Estagio: maturo — se faltar só um detalhe, pode puxar com leveza; se ja deu pra montar perfil, pode encaminhar."
+  return "Estagio: meio â€” aprofunde uso real (foto, bateria, trabalho, jogo) com naturalidade."
+ return "Estagio: maturo â€” se faltar sÃ³ um detalhe, pode puxar com leveza; se ja deu pra montar perfil, pode encaminhar."
 }
 
-async function runFlexibleDiagnosis(message, session) {
- const completion = await openai.chat.completions.create({
-  model: "gpt-4o-mini",
-  messages: [
-   { role: "system", content: diagnosisExtractPrompt },
-   {
-    role: "user",
-    content: JSON.stringify({
-     ultima_mensagem: message,
-     historico: (session.context || "").slice(-4500),
-     perfil_ja_extraido: parseQualifiers(session.qualifiers_json),
-     turn_count: session.turn_count,
-     guia_de_ritmo: diagnosisStageHint(session.turn_count),
-     operation_mode: session.operation_mode || "recommend"
-    })
-   }
-  ],
-  response_format: { type: "json_object" }
- })
- const raw = completion.choices[0].message.content || "{}"
+async function runFlexibleDiagnosis(message, session, impasseRodadas = 0) {
+ const response = await createOpenAIResponse(
+  {
+   model: OPENAI_MODEL,
+   messages: [
+    { role: "system", content: diagnosisExtractPrompt },
+    {
+     role: "user",
+     content: JSON.stringify({
+      ultima_mensagem: message,
+      historico: (session.context || "").slice(-4500),
+      perfil_ja_extraido: parseQualifiers(session.qualifiers_json),
+      turn_count: session.turn_count,
+      impasse_rodadas: Number(impasseRodadas || 0),
+      guia_de_ritmo: diagnosisStageHint(session.turn_count),
+      operation_mode: session.operation_mode || "recommend"
+     })
+    }
+   ],
+   response_format: { type: "json_object" }
+  },
+  {
+   step: "flexible_diagnosis",
+   chatId: session.chat_id,
+   conversationId: session.conversation_id
+  }
+ )
+ const raw = responsesOutputText(response) || "{}"
  const parsed = JSON.parse(raw)
  return {
   user_message:
    parsed.user_message ||
-   "Oi — tô aqui pra te ajudar a achar o celular certo, sem pressa. O que te fez pensar em trocar ou em comprar um agora?",
+   "Oi â€” tÃ´ aqui pra te ajudar a achar o celular certo, sem pressa. O que te fez pensar em trocar ou em comprar um agora?",
   qualifiers_patch:
    parsed.qualifiers_patch && typeof parsed.qualifiers_patch === "object"
     ? parsed.qualifiers_patch
@@ -1024,9 +956,11 @@ async function runConcierge(message,session,phones){
 
  try{
 
-  const completion = await openai.chat.completions.create({
+  const response = await createOpenAIResponse(
 
-   model:"gpt-4o-mini",
+   {
+
+   model: OPENAI_MODEL,
 
    messages:[
 
@@ -1045,7 +979,7 @@ Mensagem:
 
 ${message}
 
-Sessão (historico e estado — use context como linha do tempo da conversa):
+SessÃ£o (historico e estado â€” use context como linha do tempo da conversa):
 
 ${JSON.stringify(session)}
 
@@ -1067,9 +1001,15 @@ Retorne apenas JSON valido com:
    ],
    response_format: { type: "json_object" }
 
-  })
+   },
+   {
+    step: "concierge",
+    chatId: session.chat_id,
+    conversationId: session.conversation_id
+   }
+  )
 
-  const raw = completion.choices[0].message.content || "{}"
+  const raw = responsesOutputText(response) || "{}"
   const parsed = JSON.parse(raw)
   return {
    user_message: parsed.user_message || "Tenho uma opcao forte para voce. Vamos ajustar 2 detalhes?",
@@ -1144,7 +1084,7 @@ async function sendTelegram(chatId, text) {
  const preview = (text || "").slice(0, 800)
  pushTelegramLog({
   chatId,
-  text: preview + ((text || "").length > 800 ? "…" : ""),
+  text: preview + ((text || "").length > 800 ? "â€¦" : ""),
   direction: "out",
   note: "resposta bot"
  })
@@ -1158,7 +1098,7 @@ LOG VIEWER (navegador)
 
 app.get("/logs", (req, res) => {
  if (LOG_VIEWER_SECRET && req.query.key !== LOG_VIEWER_SECRET) {
-  return res.status(401).type("html").send("<p>401 — defina <code>LOG_VIEWER_SECRET</code> no .env e abra <code>/logs?key=SUA_CHAVE</code></p>")
+  return res.status(401).type("html").send("<p>401 â€” defina <code>LOG_VIEWER_SECRET</code> no .env e abra <code>/logs?key=SUA_CHAVE</code></p>")
  }
  res.type("html").send(formatLogPage(telegramMessageLog))
 })
@@ -1177,7 +1117,7 @@ app.post("/webhook",async(req,res)=>{
   }
 
   const updateId = req.body.update_id
-  if (markUpdateProcessed(updateId)) {
+  if (await markUpdateProcessed(updateId)) {
    return res.sendStatus(200)
   }
 
@@ -1188,7 +1128,7 @@ app.post("/webhook",async(req,res)=>{
    if (chatId && req.body.message) {
     pushTelegramLog({
      chatId,
-     text: "(sem texto — mídia, sticker ou comando)",
+     text: "(sem texto â€” mÃ­dia, sticker ou comando)",
      direction: "in",
      note: `update_id ${updateId}`
     })
@@ -1204,9 +1144,27 @@ app.post("/webhook",async(req,res)=>{
    note: `update_id ${updateId}`
   })
 
-  const session = getSession(chatId)
+  const session = await getSession(chatId)
   session.qualifiers_json = session.qualifiers_json || "{}"
   session.qualifier_step = Number(session.qualifier_step || 0)
+
+  const interrupt = parseHardInterrupt(message)
+  if (interrupt === "restart") {
+   resetSessionNewJourney(session)
+   session.context = appendContext("", message)
+   session.turn_count = 1
+   await sendTelegram(chatId, "RecomeÃ§ando agora! **Vamos do zero.**")
+   await sendTelegram(chatId, FLEX_NEW_CHAT_OPENER)
+   await saveSession(session)
+   return res.sendStatus(200)
+  }
+  if (interrupt === "meta_who") {
+   session.context = appendContext(session.context, message)
+   session.turn_count = Number(session.turn_count || 0) + 1
+   await sendTelegram(chatId, META_WHO_REPLY)
+   await saveSession(session)
+   return res.sendStatus(200)
+  }
 
   if (session.intent_status === "await_resume_confirm_new") {
    session.operation_mode = detectOperationMode(message, session.operation_mode || "recommend")
@@ -1221,7 +1179,7 @@ app.post("/webhook",async(req,res)=>{
     session.context = appendContext("", message)
     session.turn_count = 1
     await sendTelegram(chatId, FLEX_NEW_CHAT_OPENER)
-    saveSession(session)
+    await saveSession(session)
     return res.sendStatus(200)
    }
    if (conf === "no") {
@@ -1232,22 +1190,22 @@ app.post("/webhook",async(req,res)=>{
      session.resume_checkpoint_json = ""
      await sendTelegram(
       chatId,
-      "Sem problema — me diz por onde a gente segue: modelo ou faixa de preco?"
+      "Sem problema â€” me diz por onde a gente segue: modelo ou faixa de preco?"
      )
-     saveSession(session)
+     await saveSession(session)
      return res.sendStatus(200)
     }
-    await sendTelegram(chatId, "Beleza — **volto onde a gente parou.**")
+    await sendTelegram(chatId, "Beleza â€” **volto onde a gente parou.**")
     if (session.intent_status === "diagnosis")
      await sendTelegram(chatId, FLEX_DIAGNOSIS_RESUME)
-    saveSession(session)
+    await saveSession(session)
     return res.sendStatus(200)
    }
    await sendTelegram(
     chatId,
     "Voce tem **certeza** que quer **comecar do zero**? Responde **sim** pra zerar ou **nao** pra continuarmos de onde estavamos."
    )
-   saveSession(session)
+   await saveSession(session)
    return res.sendStatus(200)
   }
 
@@ -1263,9 +1221,9 @@ app.post("/webhook",async(req,res)=>{
     session.intent_status = "await_resume_confirm_new"
     await sendTelegram(
      chatId,
-     "Entendi — **conversa nova.** Antes de apagar o que tinhamos: **voce tem certeza?** Responde **sim** pra comecar do zero ou **nao** pra eu **voltar onde paramos**."
+     "Entendi â€” **conversa nova.** Antes de apagar o que tinhamos: **voce tem certeza?** Responde **sim** pra comecar do zero ou **nao** pra eu **voltar onde paramos**."
     )
-    saveSession(session)
+    await saveSession(session)
     return res.sendStatus(200)
    }
    if (choice === "resume") {
@@ -1278,19 +1236,19 @@ app.post("/webhook",async(req,res)=>{
       chatId,
       "Nao achei o estado anterior. Me diz por onde comecamos: orcamento aproximado ou modelo que voce quer?"
      )
-     saveSession(session)
+     await saveSession(session)
      return res.sendStatus(200)
     }
     await sendTelegram(chatId, "Beleza, seguimos de onde paramos.")
     if (session.intent_status === "diagnosis") await sendTelegram(chatId, FLEX_DIAGNOSIS_RESUME)
-    saveSession(session)
+    await saveSession(session)
     return res.sendStatus(200)
    }
    await sendTelegram(
     chatId,
     "Pode dizer de um jeito natural: **continuar** a conversa anterior ou **comecar uma nova**."
    )
-   saveSession(session)
+   await saveSession(session)
    return res.sendStatus(200)
   }
 
@@ -1306,9 +1264,9 @@ app.post("/webhook",async(req,res)=>{
    session.turn_count = Number(session.turn_count || 0) + 1
    await sendTelegram(
     chatId,
-    "Olá! Gostaria de voltar para a nossa última conversa ou prefere começar uma conversa nova?"
+    "OlÃ¡! Gostaria de voltar para a nossa Ãºltima conversa ou prefere comeÃ§ar uma conversa nova?"
    )
-   saveSession(session)
+   await saveSession(session)
    return res.sendStatus(200)
   }
 
@@ -1318,24 +1276,38 @@ app.post("/webhook",async(req,res)=>{
 
   if (session.intent_status === "diagnosis") {
    const qualifiers = parseQualifiers(session.qualifiers_json)
+   qualifiers._meta =
+    qualifiers._meta && typeof qualifiers._meta === "object" ? qualifiers._meta : {}
+   const impasseBefore = Number(qualifiers._meta.diagnosis_impasse || 0)
+   const beforeSnap = {}
+   for (const k of ["path_model", "budget", "primary_use", "battery_need", "storage"]) {
+    beforeSnap[k] = qualifiers[k]
+   }
    let diag
    try {
-    diag = await runFlexibleDiagnosis(message, session)
+    diag = await runFlexibleDiagnosis(message, session, impasseBefore)
    } catch (e) {
     console.log("Erro diagnosis flex:", e.message)
     diag = {
      user_message:
-      "Opa, perdi o fio por aqui — me conta de novo o que voce busca, do seu jeito, que eu acompanho.",
+      "Opa, perdi o fio por aqui â€” me conta de novo o que voce busca, do seu jeito, que eu acompanho.",
      qualifiers_patch: {},
      intent_status: "diagnosis"
     }
    }
    mergeQualifiersFromPatch(qualifiers, diag.qualifiers_patch, message)
-   session.qualifiers_json = JSON.stringify(qualifiers)
+   const progressed = ["path_model", "budget", "primary_use", "battery_need", "storage"].some(
+    k => qualifiers[k] !== beforeSnap[k]
+   )
    let nextIntent = diag.intent_status === "searching" ? "searching" : "diagnosis"
-   if (nextIntent === "searching" && !qualifiersRoughlyReadyForSearch(qualifiers, session)) {
+   if (nextIntent === "searching" && !qualifiersRoughlyReadyForSearch(qualifiers, session))
     nextIntent = "diagnosis"
+   if (nextIntent === "searching") {
+    qualifiers._meta.diagnosis_impasse = 0
+   } else {
+    qualifiers._meta.diagnosis_impasse = progressed ? 0 : impasseBefore + 1
    }
+   session.qualifiers_json = JSON.stringify(qualifiers)
    session.intent_status = nextIntent
    if (nextIntent === "searching") {
     session.qualifier_step = QUALIFIER_DONE_STEP
@@ -1343,10 +1315,10 @@ app.post("/webhook",async(req,res)=>{
      session.context,
      `perfil qualificado: ${qualifiersToContext(qualifiers)}`
     )
-    saveSession(session)
+    await saveSession(session)
    } else {
     await sendTelegram(chatId, diag.user_message)
-    saveSession(session)
+    await saveSession(session)
     return res.sendStatus(200)
    }
   }
@@ -1355,18 +1327,21 @@ app.post("/webhook",async(req,res)=>{
 
   if(session.intent_status==="searching"){
 
-   const query=await extractSearchQuery(session.context)
+   const query = await extractSearchQuery(session.context, {
+    chatId: session.chat_id,
+    conversationId: session.conversation_id
+   })
 
    phones = await searchPhones(query)
    phones = rankAndEnrichPhones(phones, parseQualifiers(session.qualifiers_json))
-   savePriceSnapshot(chatId, query, phones)
+   await savePriceSnapshot(chatId, query, phones)
    if (!phones.length) {
     session.intent_status = "diagnosis"
     session.qualifier_step = 0
-    saveSession(session)
+    await saveSession(session)
     await sendTelegram(
      chatId,
-     "Nao achei oferta boa nessa rodada — manda **modelo ou faixa em reais** (ou descreve o uso) que eu busco de novo, bem solto."
+     "Nao achei oferta boa nessa rodada â€” manda **modelo ou faixa em reais** (ou descreve o uso) que eu busco de novo, bem solto."
     )
     return res.sendStatus(200)
    }
@@ -1375,7 +1350,7 @@ app.post("/webhook",async(req,res)=>{
 
   const aiResponse=await runConcierge(message,session,phones)
   session.intent_status = aiResponse.intent_status
-  saveSession(session)
+  await saveSession(session)
   await sendTelegram(chatId,aiResponse.user_message)
 
   if (phones.length > 0) {
@@ -1397,14 +1372,14 @@ app.post("/webhook",async(req,res)=>{
 
 async function runHardToBeatRoutine() {
  try {
-  const rows = db.prepare("SELECT chat_id, context, qualifiers_json FROM sessions WHERE context <> ''").all()
+  const rows = await db.getAllSessionsForCron()
   if (!rows.length) return
 
   for (const row of rows) {
-   const query = await extractSearchQuery(row.context)
+   const query = await extractSearchQuery(row.context, { chatId: row.chat_id })
    const raw = await searchPhones(query)
    const phones = rankAndEnrichPhones(raw, parseQualifiers(row.qualifiers_json || "{}"))
-   savePriceSnapshot(row.chat_id, query, phones)
+   await savePriceSnapshot(row.chat_id, query, phones)
   }
 
   console.log(`[HARD_TO_BEAT] rotina concluida para ${rows.length} usuarios`)
@@ -1416,19 +1391,10 @@ async function runHardToBeatRoutine() {
 async function runMonitorTargetAlerts() {
  try {
   const today = todayKeySaoPaulo()
-  const sessions = db
-   .prepare(
-    `SELECT chat_id, context, monitor_target_brl, qualifiers_json
-     FROM sessions
-     WHERE operation_mode = 'monitor'
-     AND monitor_target_brl IS NOT NULL
-     AND monitor_target_brl > 0
-     AND (monitor_alert_sent_on IS NULL OR monitor_alert_sent_on <> ?)`
-   )
-   .all(today)
+  const sessions = await db.getMonitorSessions(today)
 
   for (const s of sessions) {
-   const query = await extractSearchQuery(s.context || "")
+   const query = await extractSearchQuery(s.context || "", { chatId: s.chat_id })
    const raw = await searchPhones(query)
    const phones = rankAndEnrichPhones(raw, parseQualifiers(s.qualifiers_json || "{}"))
    const prices = phones.map((p) => p.price_numeric).filter((n) => n !== null && n > 0)
@@ -1440,7 +1406,7 @@ async function runMonitorTargetAlerts() {
      s.chat_id,
      `Alerta Concierge: vi ofertas a partir de R$ ${minP.toLocaleString("pt-BR", { minimumFractionDigits: 2 })} (seu alvo: R$ ${alvo.toLocaleString("pt-BR", { minimumFractionDigits: 2 })}). Volte no chat e peca "buscar de novo" para links atualizados.`
     )
-    db.prepare("UPDATE sessions SET monitor_alert_sent_on = ? WHERE chat_id = ?").run(today, s.chat_id)
+    await db.updateMonitorAlertSentOn(s.chat_id, today)
    }
   }
 
@@ -1450,27 +1416,55 @@ async function runMonitorTargetAlerts() {
  }
 }
 
-cron.schedule(
- "0 9 * * *",
- async () => {
+/*
+========================================
+CRON — rota HTTP para Vercel Cron Jobs (/api/cron)
+========================================
+*/
+app.get("/api/cron", async (req, res) => {
+ if (
+  process.env.CRON_SECRET &&
+  req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`
+ ) {
+  return res.status(401).json({ error: "Unauthorized" })
+ }
+ try {
   await runHardToBeatRoutine()
   await runMonitorTargetAlerts()
- },
- { timezone: "America/Sao_Paulo" }
-)
-
-if (process.env.RUN_HARD_TO_BEAT_ON_STARTUP === "true") {
- runHardToBeatRoutine().then(() => runMonitorTargetAlerts())
-}
+  res.json({ ok: true })
+ } catch (e) {
+  console.log("[CRON] erro:", e.message)
+  res.status(500).json({ error: e.message })
+ }
+})
 
 /*
 ========================================
-SERVIDOR
+SERVIDOR — local dev ou Vercel
 ========================================
 */
 
-app.listen(PORT, () => {
- console.log(`Servidor rodando na porta ${PORT}`)
- console.log(`Log Telegram (navegador): http://localhost:${PORT}/logs`)
- if (LOG_VIEWER_SECRET) console.log("Log protegido: use /logs?key=...")
-})
+// Em ambiente Vercel o app é exportado como serverless function (sem listen)
+if (process.env.VERCEL !== "1") {
+ // Cron local: roda às 9h fuso São Paulo igual ao Vercel Cron
+ cron.schedule(
+  "0 9 * * *",
+  async () => {
+   await runHardToBeatRoutine()
+   await runMonitorTargetAlerts()
+  },
+  { timezone: "America/Sao_Paulo" }
+ )
+
+ if (process.env.RUN_HARD_TO_BEAT_ON_STARTUP === "true") {
+  runHardToBeatRoutine().then(() => runMonitorTargetAlerts())
+ }
+
+ app.listen(PORT, () => {
+  console.log(`Servidor rodando na porta ${PORT}`)
+  console.log(`Log Telegram (navegador): http://localhost:${PORT}/logs`)
+  if (LOG_VIEWER_SECRET) console.log("Log protegido: use /logs?key=...")
+ })
+}
+
+module.exports = app
