@@ -8,6 +8,9 @@
     "concierge:ligar": "powershell -ExecutionPolicy Bypass -File ./ops/concierge-control.ps1 ligar",
     "concierge:desligar": "powershell -ExecutionPolicy Bypass -File ./ops/concierge-control.ps1 desligar",
     "concierge:status": "powershell -ExecutionPolicy Bypass -File ./ops/concierge-control.ps1 status",
+    "webhook:set": "node ops/set-telegram-webhook.js",
+    "concierge:reset": "node ops/reset-sessions.js",
+    "concierge:reset-full": "node ops/reset-sessions.js --full",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
