@@ -62,13 +62,26 @@ function Start-Concierge {
     return
   }
 
-  $proc = Start-Process -FilePath $nodeCmd.Source `
-    -ArgumentList "`"$NodePath`"" `
-    -WorkingDirectory $ProjectRoot `
-    -WindowStyle Hidden `
-    -RedirectStandardOutput $LogFile `
-    -RedirectStandardError (Join-Path $ProjectRoot ".concierge.err.log") `
-    -PassThru
+  # Se VERCEL=1 estiver no ambiente (ex.: CLI Vercel), index.js nao chama app.listen() e o processo morre na hora.
+  $vercelSaved = $env:VERCEL
+  if ($null -ne $env:VERCEL -and $env:VERCEL -ne "") {
+    Remove-Item Env:\VERCEL -ErrorAction SilentlyContinue
+  }
+
+  try {
+    $proc = Start-Process -FilePath $nodeCmd.Source `
+      -ArgumentList "`"$NodePath`"" `
+      -WorkingDirectory $ProjectRoot `
+      -WindowStyle Hidden `
+      -RedirectStandardOutput $LogFile `
+      -RedirectStandardError (Join-Path $ProjectRoot ".concierge.err.log") `
+      -PassThru
+  }
+  finally {
+    if ($null -ne $vercelSaved -and $vercelSaved -ne "") {
+      $env:VERCEL = $vercelSaved
+    }
+  }
 
   if ($proc -and $proc.Id) {
     Set-Content -Path $PidFile -Value $proc.Id

@@ -1,6 +1,9 @@
 /**
- * Uso: node ops/set-telegram-webhook.js https://SEU_TUNEL.trycloudflare.com
- * Precisa de TELEGRAM_TOKEN no .env (e TELEGRAM_WEBHOOK_SECRET se usar secret no servidor).
+ * Uso local (tunel): node ops/set-telegram-webhook.js https://xxx.trycloudflare.com
+ * Uso Vercel: node ops/set-telegram-webhook.js https://SEU-PROJETO.vercel.app
+ * Webhook final: {url}/webhook
+ * Precisa TELEGRAM_TOKEN no .env; se TELEGRAM_WEBHOOK_SECRET existir no servidor, o mesmo
+ * valor deve ser enviado aqui (secret_token) — ja e feito automaticamente a partir do .env.
  */
 require("dotenv").config({ path: require("path").join(__dirname, "..", ".env") })
 

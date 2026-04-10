@@ -9,6 +9,8 @@
     "concierge:desligar": "powershell -ExecutionPolicy Bypass -File ./ops/concierge-control.ps1 desligar",
     "concierge:status": "powershell -ExecutionPolicy Bypass -File ./ops/concierge-control.ps1 status",
     "webhook:set": "node ops/set-telegram-webhook.js",
+    "webhook:info": "node ops/webhook-info.js",
+    "tunnel:cf": "npx --yes cloudflared tunnel --url http://127.0.0.1:3000",
     "concierge:reset": "node ops/reset-sessions.js",
     "concierge:reset-full": "node ops/reset-sessions.js --full",
     "test": "echo \"Error: no test specified\" && exit 1"
@@ -22,11 +24,14 @@
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.0.2",
+    "@openai/agents": "^0.8.3",
     "axios": "^1.13.5",
+    "better-sqlite3": "^12.8.0",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "node-cron": "^4.2.1",
     "openai": "^6.27.0",
-    "serpapi": "^2.2.1"
+    "serpapi": "^2.2.1",
+    "zod": "^4.3.6"
   }
 }
