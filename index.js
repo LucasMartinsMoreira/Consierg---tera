@@ -11,12 +11,49 @@ const db = require("./lib/db")
 const app = express()
 app.use(express.json({ limit: "256kb" }))
 
+app.get("/", (req, res) => {
+ res.json({
+  ok: true,
+  service: "concierge-bot",
+  webhook_post: "/webhook",
+  hint:
+   "Telegram: setWebhook = URL publica HTTPS + /webhook (tunel, VPS ou hospedagem). Ex.: npm run webhook:set -- https://seu-dominio.com",
+  concierge_agent_sdk: !/^0|false|no|off$/i.test(
+   String(process.env.OPENAI_USE_AGENTS_FOR_CONCIERGE ?? "1")
+  )
+ })
+})
+
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN
 const SERPAPI_KEY = process.env.SERPAPI_KEY
 const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || ""
 const LOG_VIEWER_SECRET = process.env.LOG_VIEWER_SECRET || ""
 const PORT = Number(process.env.PORT || 3000)
 const OPENAI_MODEL = String(process.env.OPENAI_MODEL || "gpt-4.1-mini").trim() || "gpt-4.1-mini"
+/** Por padrao usa @openai/agents (Agent Builder / SDK). Desligar: OPENAI_USE_AGENTS_FOR_CONCIERGE=0 */
+const OPENAI_USE_AGENTS_FOR_CONCIERGE = !/^0|false|no|off$/i.test(
+ String(process.env.OPENAI_USE_AGENTS_FOR_CONCIERGE ?? "1")
+)
+
+function logConfigWarnings() {
+ if (!TELEGRAM_TOKEN)
+  console.error("[config] TELEGRAM_TOKEN ausente — o bot nao consegue chamar api.telegram.org.")
+ if (!(process.env.DATABASE_URL || process.env.POSTGRES_URL)) {
+  const vercelServerlessDeployed =
+   process.env.VERCEL === "1" &&
+   ["production", "preview"].includes(String(process.env.VERCEL_ENV || ""))
+  if (vercelServerlessDeployed)
+   console.warn(
+    "[config] Deploy Vercel sem DATABASE_URL — sessoes em RAM (volatil). Defina DATABASE_URL (Neon) para persistir."
+   )
+  else console.warn("[config] Sem DATABASE_URL — lib/db.js usa SQLite (concierge.db) neste ambiente.")
+ }
+ if (TELEGRAM_WEBHOOK_SECRET)
+  console.warn(
+   "[config] TELEGRAM_WEBHOOK_SECRET ativo: o webhook no BotFather deve usar o mesmo secret (header x-telegram-bot-api-secret-token). Senao → 401 e zero respostas."
+  )
+}
+logConfigWarnings()
 const MAX_CONTEXT_CHARS = 6000
 const TELEGRAM_LOG_MAX = 500
 const telegramMessageLog = []
@@ -955,6 +992,29 @@ IA CONVERSACIONAL
 async function runConcierge(message,session,phones){
 
  try{
+  if (OPENAI_USE_AGENTS_FOR_CONCIERGE) {
+   try {
+    const { runWorkflow, buildConciergeAgentInput } = require("./lib/oconcierge-workflow")
+    const { resposta } = await runWorkflow(
+     { input_as_text: buildConciergeAgentInput(message, session, phones) },
+     { chatId: session.chat_id }
+    )
+    const hasPhones = Array.isArray(phones) && phones.length > 0
+    return {
+     user_message: resposta || "Tenho uma opcao forte para voce. Vamos ajustar 2 detalhes?",
+     user_profile: "",
+     top_recommendations: [],
+     intent_status: hasPhones
+      ? "options_given"
+      : ["diagnosis", "searching", "options_given"].includes(session.intent_status)
+       ? session.intent_status
+       : "diagnosis",
+     turn_count: session.turn_count
+    }
+   } catch (agentErr) {
+    console.log("Erro Agents SDK (concierge), fallback Responses API:", agentErr.message)
+   }
+  }
 
   const response = await createOpenAIResponse(
 
@@ -1113,6 +1173,9 @@ app.post("/webhook",async(req,res)=>{
 
  try{
   if (!isWebhookValid(req)) {
+   console.warn(
+    "[webhook] 401 — token secreto do webhook invalido ou ausente. Confira TELEGRAM_WEBHOOK_SECRET e o secret configurado no @BotFather."
+   )
    return res.sendStatus(401)
   }
 
@@ -1126,6 +1189,10 @@ app.post("/webhook",async(req,res)=>{
 
   if (!message || !chatId) {
    if (chatId && req.body.message) {
+    console.log(
+     "[webhook] update sem texto (midia/sticker/comando sem caption) — bot so processa message.text:",
+     updateId
+    )
     pushTelegramLog({
      chatId,
      text: "(sem texto â€” mÃ­dia, sticker ou comando)",
@@ -1193,14 +1260,14 @@ app.post("/webhook",async(req,res)=>{
       "Sem problema â€” me diz por onde a gente segue: modelo ou faixa de preco?"
      )
      await saveSession(session)
-     return res.sendStatus(200)
+     return
     }
     await sendTelegram(chatId, "Beleza â€” **volto onde a gente parou.**")
     if (session.intent_status === "diagnosis")
      await sendTelegram(chatId, FLEX_DIAGNOSIS_RESUME)
     await saveSession(session)
-    return res.sendStatus(200)
-   }
+    return
+  }
    await sendTelegram(
     chatId,
     "Voce tem **certeza** que quer **comecar do zero**? Responde **sim** pra zerar ou **nao** pra continuarmos de onde estavamos."
@@ -1343,7 +1410,7 @@ app.post("/webhook",async(req,res)=>{
      chatId,
      "Nao achei oferta boa nessa rodada â€” manda **modelo ou faixa em reais** (ou descreve o uso) que eu busco de novo, bem solto."
     )
-    return res.sendStatus(200)
+    return
    }
 
   }
@@ -1360,12 +1427,10 @@ app.post("/webhook",async(req,res)=>{
 
   res.sendStatus(200)
 
- }catch(e){
-
-  console.log("Erro webhook:",e.message)
-
-  res.sendStatus(200)
-
+ } catch (e) {
+  console.error("[webhook] erro (usuario nao recebe msg):", e.message)
+  if (e.stack) console.error(e.stack)
+  if (!res.headersSent) res.sendStatus(200)
  }
 
 })
@@ -1444,8 +1509,8 @@ SERVIDOR — local dev ou Vercel
 ========================================
 */
 
-// Em ambiente Vercel o app é exportado como serverless function (sem listen)
-if (process.env.VERCEL !== "1") {
+// Só escuta quando este arquivo é o entrypoint (node index.js). Em Vercel, api/index.js faz require() — sem listen.
+if (require.main === module) {
  // Cron local: roda às 9h fuso São Paulo igual ao Vercel Cron
  cron.schedule(
   "0 9 * * *",
@@ -1464,6 +1529,8 @@ if (process.env.VERCEL !== "1") {
   console.log(`Servidor rodando na porta ${PORT}`)
   console.log(`Log Telegram (navegador): http://localhost:${PORT}/logs`)
   if (LOG_VIEWER_SECRET) console.log("Log protegido: use /logs?key=...")
+  if (OPENAI_USE_AGENTS_FOR_CONCIERGE)
+   console.log("[config] Concierge via @openai/agents (Agent Builder). Desligar: OPENAI_USE_AGENTS_FOR_CONCIERGE=0")
  })
 }
 
