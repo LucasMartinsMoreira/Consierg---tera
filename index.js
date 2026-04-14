@@ -1,59 +1,20 @@
 require("dotenv").config()
 
-const path = require("path")
 const { randomUUID } = require("crypto")
 const express = require("express")
 const axios = require("axios")
-const OpenAI = require("openai")
 const cron = require("node-cron")
 const db = require("./lib/db")
+const agents = require("./lib/agents")
 
 const app = express()
 app.use(express.json({ limit: "256kb" }))
-
-app.get("/", (req, res) => {
- res.json({
-  ok: true,
-  service: "concierge-bot",
-  webhook_post: "/webhook",
-  hint:
-   "Telegram: setWebhook = URL publica HTTPS + /webhook (tunel, VPS ou hospedagem). Ex.: npm run webhook:set -- https://seu-dominio.com",
-  concierge_agent_sdk: !/^0|false|no|off$/i.test(
-   String(process.env.OPENAI_USE_AGENTS_FOR_CONCIERGE ?? "1")
-  )
- })
-})
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN
 const SERPAPI_KEY = process.env.SERPAPI_KEY
 const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || ""
 const LOG_VIEWER_SECRET = process.env.LOG_VIEWER_SECRET || ""
 const PORT = Number(process.env.PORT || 3000)
-const OPENAI_MODEL = String(process.env.OPENAI_MODEL || "gpt-4.1-mini").trim() || "gpt-4.1-mini"
-/** Por padrao usa @openai/agents (Agent Builder / SDK). Desligar: OPENAI_USE_AGENTS_FOR_CONCIERGE=0 */
-const OPENAI_USE_AGENTS_FOR_CONCIERGE = !/^0|false|no|off$/i.test(
- String(process.env.OPENAI_USE_AGENTS_FOR_CONCIERGE ?? "1")
-)
-
-function logConfigWarnings() {
- if (!TELEGRAM_TOKEN)
-  console.error("[config] TELEGRAM_TOKEN ausente — o bot nao consegue chamar api.telegram.org.")
- if (!(process.env.DATABASE_URL || process.env.POSTGRES_URL)) {
-  const vercelServerlessDeployed =
-   process.env.VERCEL === "1" &&
-   ["production", "preview"].includes(String(process.env.VERCEL_ENV || ""))
-  if (vercelServerlessDeployed)
-   console.warn(
-    "[config] Deploy Vercel sem DATABASE_URL — sessoes em RAM (volatil). Defina DATABASE_URL (Neon) para persistir."
-   )
-  else console.warn("[config] Sem DATABASE_URL — lib/db.js usa SQLite (concierge.db) neste ambiente.")
- }
- if (TELEGRAM_WEBHOOK_SECRET)
-  console.warn(
-   "[config] TELEGRAM_WEBHOOK_SECRET ativo: o webhook no BotFather deve usar o mesmo secret (header x-telegram-bot-api-secret-token). Senao → 401 e zero respostas."
-  )
-}
-logConfigWarnings()
 const MAX_CONTEXT_CHARS = 6000
 const TELEGRAM_LOG_MAX = 500
 const telegramMessageLog = []
@@ -86,14 +47,14 @@ function formatLogPage(logs) {
       .join("")
  const keyHint = LOG_VIEWER_SECRET
   ? `<p class="hint">Acesso protegido: abra com <code>?key=SUA_CHAVE</code> (LOG_VIEWER_SECRET no .env).</p>`
-  : `<p class="hint">Sem senha: em produÃ§Ã£o, defina <code>LOG_VIEWER_SECRET</code> no .env.</p>`
+  : `<p class="hint">Sem senha: em produção, defina <code>LOG_VIEWER_SECRET</code> no .env.</p>`
  return `<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <meta http-equiv="refresh" content="4"/>
-<title>Concierge â€” log Telegram</title>
+<title>Concierge — log Telegram</title>
 <style>
  body{font-family:system-ui,sans-serif;background:#0f1419;color:#e7e9ea;margin:0;padding:1rem;}
  h1{font-size:1.1rem;font-weight:600;}
@@ -107,8 +68,8 @@ function formatLogPage(logs) {
 </style>
 </head>
 <body>
-<h1>Mensagens Telegram (Ãºltimas ${logs.length})</h1>
-<p class="hint">Atualiza a cada 4s. Entrada = usuÃ¡rio; SaÃ­da = texto enviado pelo bot.</p>
+<h1>Mensagens Telegram (últimas ${logs.length})</h1>
+<p class="hint">Atualiza a cada 4s. Entrada = usuário; Saída = texto enviado pelo bot.</p>
 ${keyHint}
 <table>
 <thead><tr><th>Hora (SP)</th><th>chat_id</th><th>Dir</th><th>Texto</th><th>Nota</th></tr></thead>
@@ -118,85 +79,10 @@ ${keyHint}
 </html>`
 }
 
-const openai = new OpenAI({
- apiKey: process.env.OPENAI_API_KEY,
- ...(process.env.OPENAI_PROJECT_ID
-  ? { defaultHeaders: { "OpenAI-Project": process.env.OPENAI_PROJECT_ID } }
-  : {})
-})
-
-/** Armazena respostas na OpenAI (metadados no projeto). Defina OPENAI_STORE_COMPLETIONS=1 no .env. */
-const OPENAI_STORE_COMPLETIONS = /^1|true|yes$/i.test(
- String(process.env.OPENAI_STORE_COMPLETIONS || "")
-)
-
-function openaiTraceLine(fields) {
- const parts = Object.entries(fields).map(([k, v]) => `${k}=${v}`)
- console.log(`[openai] ${parts.join(" ")}`)
-}
-
-/** Texto agregado da Responses API (fallback se output_text vier vazio). */
-function responsesOutputText(response) {
- const direct = String(response.output_text || "").trim()
- if (direct) return response.output_text
- const items = response.output || []
- for (const item of items) {
-  if (item.type !== "message" || !item.content) continue
-  const texts = []
-  for (const part of item.content) {
-   if (part.type === "output_text" && part.text) texts.push(part.text)
-  }
-  if (texts.length) return texts.join("")
- }
- return ""
-}
-
-/**
- * Responses API (recomendada pela OpenAI em relaÃ§Ã£o a Chat Completions).
- * @see https://developers.openai.com/api/docs/guides/migrate-to-responses
- *
- * body: { model, messages, response_format?: { type: 'json_object' } }
- */
-async function createOpenAIResponse(body, ctx) {
- const clientRequestId = randomUUID()
- const headers = { "X-Client-Request-Id": clientRequestId }
- const { model, messages, response_format, ...rest } = body
- const req = {
-  model: model || OPENAI_MODEL,
-  input: messages,
-  ...rest
- }
- if (response_format && response_format.type === "json_object") {
-  req.text = { format: { type: "json_object" } }
- }
- if (OPENAI_STORE_COMPLETIONS) {
-  const meta = {
-   app: "concierge-bot",
-   step: String(ctx.step || "call").slice(0, 64)
-  }
-  if (ctx.chatId) meta.chat_id = String(ctx.chatId).slice(0, 512)
-  if (ctx.conversationId) meta.conv = String(ctx.conversationId).slice(0, 512)
-  req.store = true
-  req.metadata = meta
- }
- const response = await openai.responses.create(req, { headers })
- openaiTraceLine({
-  step: ctx.step,
-  client_request_id: clientRequestId,
-  x_request_id: response._request_id || "",
-  response_id: response.id,
-  chat_id: ctx.chatId || "-"
- })
- return response
-}
-
 const http = axios.create({
  timeout: 15000
 })
 
-// Inicializa tabelas no Postgres na primeira chamada (lazy via lib/db.js)
-
-// getSession e saveSession delegam para lib/db.js (async/PostgreSQL)
 const getSession = db.getSession.bind(db)
 const saveSession = db.saveSession.bind(db)
 
@@ -274,7 +160,7 @@ function rankAndEnrichPhones(phones, qualifiers) {
   const storM = storageHintMatch(p.model, q)
   const score = pricePart + trust + storM
   const reasons = []
-  if (p.price_numeric) reasons.push(`preÃ§o relativo ${pricePart.toFixed(0)}/35`)
+  if (p.price_numeric) reasons.push(`preço relativo ${pricePart.toFixed(0)}/35`)
   if (trust) reasons.push(`loja +${trust}`)
   if (storM > 2) reasons.push(`armazenamento +${storM}`)
   return {
@@ -289,23 +175,23 @@ function rankAndEnrichPhones(phones, qualifiers) {
 function detectOperationMode(message, currentMode) {
  const l = (message || "").toLowerCase()
  if (
-  /monitor|acompanh|alerta|avisar|avis(o|e)|pre[cÃ§]o alvo|preco-alvo|esperar cair|queda de pre/.test(l)
+  /monitor|acompanh|alerta|avisar|avis(o|e)|pre[cç]o alvo|preco-alvo|esperar cair|queda de pre/.test(l)
  )
   return "monitor"
- if (/comprar agora|recomend|melhor op|qual (comprar|pego)|sugest(a|Ã£o)/.test(l)) return "recommend"
+ if (/comprar agora|recomend|melhor op|qual (comprar|pego)|sugest(a|ão)/.test(l)) return "recommend"
  return currentMode === "monitor" ? "monitor" : currentMode === "recommend" ? "recommend" : "recommend"
 }
 
 function parseMonitorTargetBrl(message) {
  const raw = message || ""
  const m = raw.match(
-  /(?:alvo|ate|atÃ©|m[aÃ¡]ximo|teto|m[aÃ¡]x)\s*[:\s]*R?\$?\s*([\d]{1,3}(?:\.[\d]{3})*(?:,[\d]{2})?|[\d]+(?:,[\d]{2})?)/i
+  /(?:alvo|ate|até|m[aá]ximo|teto|m[aá]x)\s*[:\s]*R?\$?\s*([\d]{1,3}(?:\.[\d]{3})*(?:,[\d]{2})?|[\d]+(?:,[\d]{2})?)/i
  )
  if (m) {
   const n = parseBrlPriceString(m[1])
   if (n && n > 0) return n
  }
- if (/monitor|alvo|pre[cÃ§]o|preco|acompanh/i.test(raw)) {
+ if (/monitor|alvo|pre[cç]o|preco|acompanh/i.test(raw)) {
   const d = raw.match(/\b(\d{3,5})\b/)
   if (d) {
    const n = Number(d[1])
@@ -319,7 +205,6 @@ function todayKeySaoPaulo() {
  return new Date().toLocaleDateString("en-CA", { timeZone: "America/Sao_Paulo" })
 }
 
-// markUpdateProcessed e savePriceSnapshot delegam para lib/db.js (async/PostgreSQL)
 const markUpdateProcessed = db.markUpdateProcessed.bind(db)
 const savePriceSnapshot = db.savePriceSnapshot.bind(db)
 
@@ -328,23 +213,28 @@ function appendContext(context, message) {
  return next.length > MAX_CONTEXT_CHARS ? next.slice(-MAX_CONTEXT_CHARS) : next
 }
 
+function applyModeAndTarget(session, message) {
+ session.operation_mode = detectOperationMode(message, session.operation_mode || "recommend")
+ const alvo = parseMonitorTargetBrl(message)
+ if (alvo !== null) session.monitor_target_brl = alvo
+}
+
 function isWebhookValid(req) {
  if (!TELEGRAM_WEBHOOK_SECRET) return true
  const token = req.headers["x-telegram-bot-api-secret-token"]
  return token === TELEGRAM_WEBHOOK_SECRET
 }
 
-/** Passo â€œterminamos o funilâ€ (sem perguntas fixas por indice). */
 const QUALIFIER_DONE_STEP = 99
 
 const FLEX_DIAGNOSIS_RESUME =
- "Otimo, retomando â€” sem pressa. O que **mais importa** pra voce nesse celular agora?"
+ "Otimo, retomando — sem pressa. O que **mais importa** pra voce nesse celular agora?"
 
 const FLEX_NEW_CHAT_OPENER =
- "Combinado, comecamos de novo. Me conta **com calma** o cenario: troca o que ta quebrado, upgrade, presenteâ€¦ o que trouxe voce aqui?"
+ "Combinado, comecamos de novo. Me conta **com calma** o cenario: troca o que ta quebrado, upgrade, presente… o que trouxe voce aqui?"
 
 const META_WHO_REPLY =
- "Sou o **Concierge**: te ajudo a escolher smartphone com **custo real** e seguranÃ§a (loja confiavel, parcelas, o que importa pra voce). **Nao** sou formulario â€” manda ver o que precisa, ou diz **reiniciar** se quiser zerar o papo."
+ "Sou o **Concierge**: te ajudo a escolher smartphone com **custo real** e segurança (loja confiavel, parcelas, o que importa pra voce). **Nao** sou formulario — manda ver o que precisa, ou diz **reiniciar** se quiser zerar o papo."
 
 const UNCERTAIN_CONCIERGE_LINE =
  "Putz, me enrolei aqui! **Nao tenho essa informacao agora.** Vamos **retomar de onde paramos** ou prefere **resetar o papo**? (Pode escrever **reiniciar**.)"
@@ -380,7 +270,7 @@ function extractBudgetReaisFromMessage(text) {
   const n = parseBrlPriceString(m[1])
   if (n !== null && n >= 200 && n <= 1500000) return n
  }
- const ate = lower.match(/(?:ate|atÃ©)\s+(?:uns?\s+)?(?:r\$\s*)?([\d.,]+)\s*(?:reais)?/)
+ const ate = lower.match(/(?:ate|até)\s+(?:uns?\s+)?(?:r\$\s*)?([\d.,]+)\s*(?:reais)?/)
  if (ate) {
   const n = parseBrlPriceString(ate[1])
   if (n !== null && n >= 200 && n <= 1500000) return n
@@ -406,14 +296,14 @@ function parseQualifierAnswer(key, message) {
    )
   )
    return "modelo_em_mente"
-  if (/(explorar|indica|sugere|nao sei|nÃ£o sei|melhor opc|custo benef|orÃ§a|orÃ§amento)/i.test(lower))
+  if (/(explorar|indica|sugere|nao sei|não sei|melhor opc|custo benef|orça|orçamento)/i.test(lower))
    return "explorar_opcoes"
   return "explorar_opcoes"
  }
 
  if (key === "budget") {
   if (
-   /sem limite|sem teto|flex[iÃ­]vel|ilimitad|nao sei|nÃ£o sei|nao tenho|nÃ£o tenho|qualquer|tanto faz|open budget|economizar|o mais barato|^barato$/i.test(
+   /sem limite|sem teto|flex[ií]vel|ilimitad|nao sei|não sei|nao tenho|não tenho|qualquer|tanto faz|open budget|economizar|o mais barato|^barato$/i.test(
     lower
    )
   )
@@ -445,12 +335,12 @@ function parseQualifierAnswer(key, message) {
 
  if (key === "battery_need") {
   if (
-   /(sim|muito|bastante|dia todo|o dia inteiro|o dia todo|pesad[o]|aguenta|duradour|autonomia|no m[iÃ­]nimo|preciso.*bateria|bateria.*importante|trilha|dois dias|rolÃª|role)/i.test(
+   /(sim|muito|bastante|dia todo|o dia inteiro|o dia todo|pesad[o]|aguenta|duradour|autonomia|no m[ií]nimo|preciso.*bateria|bateria.*importante|trilha|dois dias|rolê|role)/i.test(
     lower
    )
   )
    return "alta"
-  if (/(nao|nÃ£o|normal|leve|moderad|basico|s[oÃ³] redes sociais)/.test(lower)) return "normal"
+  if (/(nao|não|normal|leve|moderad|basico|s[oó] redes sociais)/.test(lower)) return "normal"
   return null
  }
 
@@ -459,7 +349,7 @@ function parseQualifierAnswer(key, message) {
   if (/(512)/.test(lower)) return "512GB"
   if (/(256)/.test(lower)) return "256GB"
   if (/(128)/.test(lower)) return "128GB"
-  if (/medio|m[eÃ©]dia|intermedi|nao sei|nÃ£o sei|tanto faz|indiferente/.test(lower)) return "256GB"
+  if (/medio|m[eé]dia|intermedi|nao sei|não sei|tanto faz|indiferente/.test(lower)) return "256GB"
   return null
  }
 
@@ -472,7 +362,7 @@ function normalizeChatTokens(s) {
   .toLowerCase()
   .normalize("NFD")
   .replace(/[\u0300-\u036f]/g, "")
-  .replace(/[!?.#,;:â€¦]+/g, " ")
+  .replace(/[!?.#,;:…]+/g, " ")
   .replace(/\s+/g, " ")
   .trim()
 }
@@ -481,7 +371,7 @@ function isCasualGreeting(text) {
  const raw = String(text || "").trim()
  if (!raw || raw.length > 120) return false
  if (
-  /(quero|preciso|comprar|or[cÃ§]amento|orcamento|iphone|android|celular|smartphone|pixel|galaxy|xiaomi|motorola|r\$|\breais\b|\b\d{4,}\b)/i.test(
+  /(quero|preciso|comprar|or[cç]amento|orcamento|iphone|android|celular|smartphone|pixel|galaxy|xiaomi|motorola|r\$|\breais\b|\b\d{4,}\b)/i.test(
    raw
   )
  )
@@ -496,14 +386,13 @@ function isCasualGreeting(text) {
  )
 }
 
-/** Saudacao / encheÃ§Ã£o curta no passo de orÃ§amento (evita loop em "e ai beleza?"). */
 function isBudgetConversationFiller(text) {
  const raw = String(text || "").trim()
  if (!raw || raw.length > 90) return false
  if (/\br\$\s*[\d.,]+/i.test(raw)) return false
  if (extractBudgetReaisFromMessage(raw) !== null) return false
  if (
-  /(quero|preciso|vou comprar|comprar um|comprar uma|iphone|galaxy|pixel|celular|smartphone|or[cÃ§]amento|orcamento)/i.test(
+  /(quero|preciso|vou comprar|comprar um|comprar uma|iphone|galaxy|pixel|celular|smartphone|or[cç]amento|orcamento)/i.test(
    raw
   )
  )
@@ -580,7 +469,6 @@ function qualifiersRoughlyReadyForSearch(qualifiers, session) {
  return false
 }
 
-/** Comandos que interrompem o fluxo: prioridade sobre diagnostico (O/C/A). */
 function parseHardInterrupt(text) {
  const t = normalizeChatTokens(text)
  if (!t || t.length > 120) return null
@@ -670,12 +558,7 @@ function resetSessionNewJourney(session) {
 }
 
 function parseResumeChoice(text) {
- const t = String(text || "")
-  .toLowerCase()
-  .normalize("NFD")
-  .replace(/[\u0300-\u036f]/g, "")
-  .trim()
-  .replace(/\s+/g, " ")
+ const t = normalizeChatTokens(text)
  if (!t) return null
  if (
   /(prefiro\s+(comecar|uma\s+nova)|quero\s+(comecar|uma\s+nova|uma\s+nova)|nao\s+(quero|vou)\s+continu)/i.test(
@@ -684,7 +567,7 @@ function parseResumeChoice(text) {
  )
   return "new"
  if (
-  /(^|\b)(comecar\s+uma\s+nova|comecar\s+nova\b|uma\s+nova\s+conversa|so\s+nova\b|s[oÃ³]\s+nova\b)(\b|$)/i.test(
+  /(^|\b)(comecar\s+uma\s+nova|comecar\s+nova\b|uma\s+nova\s+conversa|so\s+nova\b|s[oó]\s+nova\b)(\b|$)/i.test(
    t
   )
  )
@@ -707,7 +590,6 @@ function parseResumeChoice(text) {
  return null
 }
 
-/** Depois de pedir confirmacao para conversa nova: sim = zera; nao = restaura checkpoint. */
 function parseNewConversationConfirm(message) {
  const t = normalizeChatTokens(message)
  if (!t) return null
@@ -791,49 +673,13 @@ EXTRAIR QUERY DE BUSCA
 */
 
 async function extractSearchQuery(context, traceCtx = {}) {
-
- try{
-
-  const response = await createOpenAIResponse(
-
-   {
-
-   model: OPENAI_MODEL,
-
-   messages:[
-    {
-     role:"system",
-     content:"Extraia uma query curta para buscar smartphones e retorne JSON com a chave query."
-    },
-    {
-     role:"user",
-     content:`
-Contexto do usuÃ¡rio:
-
-${context}
-
-Retorne somente JSON valido: {"query":"..."}.
-`
-    }
-   ],
-   response_format: { type: "json_object" }
-
-   },
-   { step: "extract_search_query", ...traceCtx }
-  )
-
-  const raw = responsesOutputText(response) || "{}"
-  const parsed = JSON.parse(raw)
-  return (parsed.query || "").trim() || "smartphone"
-
- }catch(e){
-
-  console.log("Erro parser query")
-
+ try {
+  const result = await agents.runSearchQueryAgent(context)
+  return (result.query || "").trim() || "smartphone"
+ } catch (e) {
+  console.log("Erro parser query:", e.message)
   return "smartphone"
-
  }
-
 }
 
 /*
@@ -887,25 +733,25 @@ PROMPT CONCIERGE
 */
 
 const conciergePrompt = `
-O â€” OBJETIVO: Consultor **elite** em smartphones. Sucesso = conversa **fluida**; **priorize a vontade do usuario** sobre qualquer roteiro tecnico.
+O — OBJETIVO: Consultor **elite** em smartphones. Sucesso = conversa **fluida**; **priorize a vontade do usuario** sobre qualquer roteiro tecnico.
 
-C â€” CONTEXTO: Guia **proativo**, nao formulario. Se o usuario mudar de assunto ou pedir para recomecar, o fluxo ja pode ter sido tratado â€” aqui continue **ouvindo** e respondendo a ultima mensagem de verdade.
+C — CONTEXTO: Guia **proativo**, nao formulario. Se o usuario mudar de assunto ou pedir para recomecar, o fluxo ja pode ter sido tratado — aqui continue **ouvindo** e respondendo a ultima mensagem de verdade.
 
 CANAL API:
 - Responda so JSON: user_message, user_profile, top_recommendations, intent_status, turn_count.
 - user_message = **texto natural** para Telegram (sem JSON, sem codigo). **Negrito** em aparelhos e precos; bullets para pros/contras.
 - Sem URLs na user_message se ja houver produtos na lista (o app envia links a parte).
 
-A â€” ACOES:
+A — ACOES:
 - Se se perder ou for tema fora do escopo: algo como "**Putz, me enrolei aqui!** Nao tenho essa informacao agora. Vamos **retomar** ou **resetar o papo**?"
-- **Custo e seguranca**: Ã  vista vs parcelado sem juros quando der; cashback/frete quando fizer sentido; **Reclame Aqui** / reputacao das lojas (MVP: validar na pratica se nao tiver nota na lista).
+- **Custo e seguranca**: à vista vs parcelado sem juros quando der; cashback/frete quando fizer sentido; **Reclame Aqui** / reputacao das lojas (MVP: validar na pratica se nao tiver nota na lista).
 - Comparativo: pro/contra em bateria real, camera, performance.
 
-N â€” NORMAS:
+N — NORMAS:
 - **Antigolpe**: lojas oficiais e grandes varejistas (Amazon BR, Magalu, Mercado Livre, Casas Bahia, KaBuM, Fast Shop, Ponto, etc.). Marketplace so se for logica de fabricante.
 - Se **3 impasses** seguidos (sem avanco), sugira a **Nathalia** (criadora humana) com simpatia.
 
-S â€” SAIDA: charmoso, direto. **Nunca** ignore uma frase do usuario para forcar pergunta de diagnostico.
+S — SAIDA: charmoso, direto. **Nunca** ignore uma frase do usuario para forcar pergunta de diagnostico.
 
 Modo operation_mode: recommend | monitor (rotina de precos; sem prometer compra automatica).
 
@@ -913,13 +759,13 @@ intent_status: diagnosis | searching | options_given como ja definido.
 `
 
 const diagnosisExtractPrompt = `
-O â€” OBJETIVO: Mesmo do Concierge â€” conversa fluida; **priorize o pedido atual** do usuario, nao um script.
+O — OBJETIVO: Mesmo do Concierge — conversa fluida; **priorize o pedido atual** do usuario, nao um script.
 
-C â€” CONTEXTO: **Nao e formulario.** Comandos tipo "reiniciar" ou "quem e voce?" o backend pode tratar antes; se a mensagem ainda for sobre isso, responda **humanamente** e convide a seguir.
+C — CONTEXTO: **Nao e formulario.** Comandos tipo "reiniciar" ou "quem e voce?" o backend pode tratar antes; se a mensagem ainda for sobre isso, responda **humanamente** e convide a seguir.
 
-A â€” ACOES:
-1) **Escuta ativa (prioridade 1):** **Nunca ignore** o que a pessoa disse so para encaixar pergunta de diagnostico â€” cite ou responda primeiro.
-2) **Diagnostico adaptativo:** vago ("quero um celular") â†’ estilo de vida, curiosidade leve. **Direto** ("quero o S23") â†’ menos rodeio; caminhe para **analise de custo e seguranca** (intent "searching" quando ja der pra buscar ofertas).
+A — ACOES:
+1) **Escuta ativa (prioridade 1):** **Nunca ignore** o que a pessoa disse so para encaixar pergunta de diagnostico — cite ou responda primeiro.
+2) **Diagnostico adaptativo:** vago ("quero um celular") → estilo de vida, curiosidade leve. **Direto** ("quero o S23") → menos rodeio; caminhe para **analise de custo e seguranca** (intent "searching" quando ja der pra buscar ofertas).
 3) **Desconhecimento / fora do escopo:** use ideia de: "${UNCERTAIN_CONCIERGE_LINE}" (pode variar o texto, mantenha o tom).
 4) Se **impasse_rodadas** no payload for >= 3: inclua oferta gentil de falar com a **Nathalia** (criadora).
 
@@ -936,50 +782,28 @@ JSON: {"user_message":"...","qualifiers_patch":{},"intent_status":"diagnosis"|"s
 function diagnosisStageHint(turnCount) {
  const tc = Number(turnCount || 0)
  if (tc <= 2)
-  return "Estagio: inicio â€” conheÃ§a a pessoa; nao cobre teto de preco se ela sÃ³ entrou no assunto."
+  return "Estagio: inicio — conheça a pessoa; nao cobre teto de preco se ela só entrou no assunto."
  if (tc <= 6)
-  return "Estagio: meio â€” aprofunde uso real (foto, bateria, trabalho, jogo) com naturalidade."
- return "Estagio: maturo â€” se faltar sÃ³ um detalhe, pode puxar com leveza; se ja deu pra montar perfil, pode encaminhar."
+  return "Estagio: meio — aprofunde uso real (foto, bateria, trabalho, jogo) com naturalidade."
+ return "Estagio: maturo — se faltar só um detalhe, pode puxar com leveza; se ja deu pra montar perfil, pode encaminhar."
 }
 
 async function runFlexibleDiagnosis(message, session, impasseRodadas = 0) {
- const response = await createOpenAIResponse(
-  {
-   model: OPENAI_MODEL,
-   messages: [
-    { role: "system", content: diagnosisExtractPrompt },
-    {
-     role: "user",
-     content: JSON.stringify({
-      ultima_mensagem: message,
-      historico: (session.context || "").slice(-4500),
-      perfil_ja_extraido: parseQualifiers(session.qualifiers_json),
-      turn_count: session.turn_count,
-      impasse_rodadas: Number(impasseRodadas || 0),
-      guia_de_ritmo: diagnosisStageHint(session.turn_count),
-      operation_mode: session.operation_mode || "recommend"
-     })
-    }
-   ],
-   response_format: { type: "json_object" }
-  },
-  {
-   step: "flexible_diagnosis",
-   chatId: session.chat_id,
-   conversationId: session.conversation_id
-  }
- )
- const raw = responsesOutputText(response) || "{}"
- const parsed = JSON.parse(raw)
+ const userPayload = JSON.stringify({
+  ultima_mensagem: message,
+  historico: (session.context || "").slice(-4500),
+  perfil_ja_extraido: parseQualifiers(session.qualifiers_json),
+  turn_count: session.turn_count,
+  impasse_rodadas: Number(impasseRodadas || 0),
+  guia_de_ritmo: diagnosisStageHint(session.turn_count),
+  operation_mode: session.operation_mode || "recommend"
+ })
+ const result = await agents.runDiagnosisAgent(diagnosisExtractPrompt, userPayload)
  return {
-  user_message:
-   parsed.user_message ||
-   "Oi â€” tÃ´ aqui pra te ajudar a achar o celular certo, sem pressa. O que te fez pensar em trocar ou em comprar um agora?",
-  qualifiers_patch:
-   parsed.qualifiers_patch && typeof parsed.qualifiers_patch === "object"
-    ? parsed.qualifiers_patch
-    : {},
-  intent_status: parsed.intent_status === "searching" ? "searching" : "diagnosis"
+  user_message: result.user_message ||
+   "Oi — tô aqui pra te ajudar a achar o celular certo, sem pressa. O que te fez pensar em trocar ou em comprar um agora?",
+  qualifiers_patch: result.qualifiers_patch || {},
+  intent_status: result.intent_status === "searching" ? "searching" : "diagnosis"
  }
 }
 
@@ -989,102 +813,35 @@ IA CONVERSACIONAL
 ========================================
 */
 
-async function runConcierge(message,session,phones){
-
- try{
-  if (OPENAI_USE_AGENTS_FOR_CONCIERGE) {
-   try {
-    const { runWorkflow, buildConciergeAgentInput } = require("./lib/oconcierge-workflow")
-    const { resposta } = await runWorkflow(
-     { input_as_text: buildConciergeAgentInput(message, session, phones) },
-     { chatId: session.chat_id }
-    )
-    const hasPhones = Array.isArray(phones) && phones.length > 0
-    return {
-     user_message: resposta || "Tenho uma opcao forte para voce. Vamos ajustar 2 detalhes?",
-     user_profile: "",
-     top_recommendations: [],
-     intent_status: hasPhones
-      ? "options_given"
-      : ["diagnosis", "searching", "options_given"].includes(session.intent_status)
-       ? session.intent_status
-       : "diagnosis",
-     turn_count: session.turn_count
-    }
-   } catch (agentErr) {
-    console.log("Erro Agents SDK (concierge), fallback Responses API:", agentErr.message)
-   }
-  }
-
-  const response = await createOpenAIResponse(
-
-   {
-
-   model: OPENAI_MODEL,
-
-   messages:[
-
-    {
-     role:"system",
-     content:conciergePrompt
-    },
-
-    {
-     role:"user",
-     content:`
-conversation_id: ${session.conversation_id || "desconhecido"}
+async function runConcierge(message, session, phones) {
+ try {
+  const userPayload = `conversation_id: ${session.conversation_id || "desconhecido"}
 chat_id (Telegram): ${session.chat_id}
 
 Mensagem:
 
 ${message}
 
-SessÃ£o (historico e estado â€” use context como linha do tempo da conversa):
+Sessão (historico e estado — use context como linha do tempo da conversa):
 
 ${JSON.stringify(session)}
 
 Produtos (ja ordenados por ranking; campos rank_score e rank_reason explicam o indice):
 
-${JSON.stringify(phones)}
+${JSON.stringify(phones)}`
 
-Retorne apenas JSON valido com:
-{
- "user_message": "string",
- "user_profile": "string",
- "top_recommendations": [],
- "intent_status": "diagnosis|searching|options_given",
- "turn_count": number
-}
-`
-    }
-
-   ],
-   response_format: { type: "json_object" }
-
-   },
-   {
-    step: "concierge",
-    chatId: session.chat_id,
-    conversationId: session.conversation_id
-   }
-  )
-
-  const raw = responsesOutputText(response) || "{}"
-  const parsed = JSON.parse(raw)
+  const result = await agents.runConciergeAgent(conciergePrompt, userPayload)
   return {
-   user_message: parsed.user_message || "Tenho uma opcao forte para voce. Vamos ajustar 2 detalhes?",
-   user_profile: parsed.user_profile || "",
-   top_recommendations: Array.isArray(parsed.top_recommendations) ? parsed.top_recommendations : [],
-   intent_status: ["diagnosis", "searching", "options_given"].includes(parsed.intent_status)
-    ? parsed.intent_status
+   user_message: result.user_message || "Tenho uma opcao forte para voce. Vamos ajustar 2 detalhes?",
+   user_profile: result.user_profile || "",
+   top_recommendations: result.top_recommendations || [],
+   intent_status: ["diagnosis", "searching", "options_given"].includes(result.intent_status)
+    ? result.intent_status
     : session.intent_status || "diagnosis",
-   turn_count: Number.isInteger(parsed.turn_count) ? parsed.turn_count : session.turn_count
+   turn_count: Number.isInteger(result.turn_count) ? result.turn_count : session.turn_count
   }
-
- }catch(e){
-
-  console.log("Erro IA:",e.message)
-
+ } catch (e) {
+  console.log("Erro IA:", e.message)
   return {
    user_message: "Tive um problema rapido aqui. Me diga seu foco: camera, bateria ou preco?",
    user_profile: "",
@@ -1092,9 +849,7 @@ Retorne apenas JSON valido com:
    intent_status: "diagnosis",
    turn_count: session.turn_count
   }
-
  }
-
 }
 
 /*
@@ -1144,7 +899,7 @@ async function sendTelegram(chatId, text) {
  const preview = (text || "").slice(0, 800)
  pushTelegramLog({
   chatId,
-  text: preview + ((text || "").length > 800 ? "â€¦" : ""),
+  text: preview + ((text || "").length > 800 ? "…" : ""),
   direction: "out",
   note: "resposta bot"
  })
@@ -1158,7 +913,7 @@ LOG VIEWER (navegador)
 
 app.get("/logs", (req, res) => {
  if (LOG_VIEWER_SECRET && req.query.key !== LOG_VIEWER_SECRET) {
-  return res.status(401).type("html").send("<p>401 â€” defina <code>LOG_VIEWER_SECRET</code> no .env e abra <code>/logs?key=SUA_CHAVE</code></p>")
+  return res.status(401).type("html").send("<p>401 — defina <code>LOG_VIEWER_SECRET</code> no .env e abra <code>/logs?key=SUA_CHAVE</code></p>")
  }
  res.type("html").send(formatLogPage(telegramMessageLog))
 })
@@ -1173,9 +928,6 @@ app.post("/webhook",async(req,res)=>{
 
  try{
   if (!isWebhookValid(req)) {
-   console.warn(
-    "[webhook] 401 — token secreto do webhook invalido ou ausente. Confira TELEGRAM_WEBHOOK_SECRET e o secret configurado no @BotFather."
-   )
    return res.sendStatus(401)
   }
 
@@ -1189,13 +941,9 @@ app.post("/webhook",async(req,res)=>{
 
   if (!message || !chatId) {
    if (chatId && req.body.message) {
-    console.log(
-     "[webhook] update sem texto (midia/sticker/comando sem caption) — bot so processa message.text:",
-     updateId
-    )
     pushTelegramLog({
      chatId,
-     text: "(sem texto â€” mÃ­dia, sticker ou comando)",
+     text: "(sem texto — mídia, sticker ou comando)",
      direction: "in",
      note: `update_id ${updateId}`
     })
@@ -1212,15 +960,13 @@ app.post("/webhook",async(req,res)=>{
   })
 
   const session = await getSession(chatId)
-  session.qualifiers_json = session.qualifiers_json || "{}"
-  session.qualifier_step = Number(session.qualifier_step || 0)
 
   const interrupt = parseHardInterrupt(message)
   if (interrupt === "restart") {
    resetSessionNewJourney(session)
    session.context = appendContext("", message)
    session.turn_count = 1
-   await sendTelegram(chatId, "RecomeÃ§ando agora! **Vamos do zero.**")
+   await sendTelegram(chatId, "Recomeçando agora! **Vamos do zero.**")
    await sendTelegram(chatId, FLEX_NEW_CHAT_OPENER)
    await saveSession(session)
    return res.sendStatus(200)
@@ -1234,10 +980,7 @@ app.post("/webhook",async(req,res)=>{
   }
 
   if (session.intent_status === "await_resume_confirm_new") {
-   session.operation_mode = detectOperationMode(message, session.operation_mode || "recommend")
-   const alvoConf = parseMonitorTargetBrl(message)
-   if (alvoConf !== null) session.monitor_target_brl = alvoConf
-
+   applyModeAndTarget(session, message)
    session.context = appendContext(session.context, message)
    session.turn_count++
    const conf = parseNewConversationConfirm(message)
@@ -1257,17 +1000,17 @@ app.post("/webhook",async(req,res)=>{
      session.resume_checkpoint_json = ""
      await sendTelegram(
       chatId,
-      "Sem problema â€” me diz por onde a gente segue: modelo ou faixa de preco?"
+      "Sem problema — me diz por onde a gente segue: modelo ou faixa de preco?"
      )
      await saveSession(session)
-     return
+     return res.sendStatus(200)
     }
-    await sendTelegram(chatId, "Beleza â€” **volto onde a gente parou.**")
+    await sendTelegram(chatId, "Beleza — **volto onde a gente parou.**")
     if (session.intent_status === "diagnosis")
      await sendTelegram(chatId, FLEX_DIAGNOSIS_RESUME)
     await saveSession(session)
-    return
-  }
+    return res.sendStatus(200)
+   }
    await sendTelegram(
     chatId,
     "Voce tem **certeza** que quer **comecar do zero**? Responde **sim** pra zerar ou **nao** pra continuarmos de onde estavamos."
@@ -1277,10 +1020,7 @@ app.post("/webhook",async(req,res)=>{
   }
 
   if (session.intent_status === "await_resume_choice") {
-   session.operation_mode = detectOperationMode(message, session.operation_mode || "recommend")
-   const alvoResume = parseMonitorTargetBrl(message)
-   if (alvoResume !== null) session.monitor_target_brl = alvoResume
-
+   applyModeAndTarget(session, message)
    session.context = appendContext(session.context, message)
    session.turn_count++
    const choice = parseResumeChoice(message)
@@ -1288,7 +1028,7 @@ app.post("/webhook",async(req,res)=>{
     session.intent_status = "await_resume_confirm_new"
     await sendTelegram(
      chatId,
-     "Entendi â€” **conversa nova.** Antes de apagar o que tinhamos: **voce tem certeza?** Responde **sim** pra comecar do zero ou **nao** pra eu **voltar onde paramos**."
+     "Entendi — **conversa nova.** Antes de apagar o que tinhamos: **voce tem certeza?** Responde **sim** pra comecar do zero ou **nao** pra eu **voltar onde paramos**."
     )
     await saveSession(session)
     return res.sendStatus(200)
@@ -1319,9 +1059,7 @@ app.post("/webhook",async(req,res)=>{
    return res.sendStatus(200)
   }
 
-  session.operation_mode = detectOperationMode(message, session.operation_mode || "recommend")
-  const alvo = parseMonitorTargetBrl(message)
-  if (alvo !== null) session.monitor_target_brl = alvo
+  applyModeAndTarget(session, message)
 
   if (isCasualGreeting(message) && hasResumableConversation(session)) {
    const checkpoint = buildResumeCheckpoint(session)
@@ -1331,7 +1069,7 @@ app.post("/webhook",async(req,res)=>{
    session.turn_count = Number(session.turn_count || 0) + 1
    await sendTelegram(
     chatId,
-    "OlÃ¡! Gostaria de voltar para a nossa Ãºltima conversa ou prefere comeÃ§ar uma conversa nova?"
+    "Olá! Gostaria de voltar para a nossa última conversa ou prefere começar uma conversa nova?"
    )
    await saveSession(session)
    return res.sendStatus(200)
@@ -1357,7 +1095,7 @@ app.post("/webhook",async(req,res)=>{
     console.log("Erro diagnosis flex:", e.message)
     diag = {
      user_message:
-      "Opa, perdi o fio por aqui â€” me conta de novo o que voce busca, do seu jeito, que eu acompanho.",
+      "Opa, perdi o fio por aqui — me conta de novo o que voce busca, do seu jeito, que eu acompanho.",
      qualifiers_patch: {},
      intent_status: "diagnosis"
     }
@@ -1408,9 +1146,9 @@ app.post("/webhook",async(req,res)=>{
     await saveSession(session)
     await sendTelegram(
      chatId,
-     "Nao achei oferta boa nessa rodada â€” manda **modelo ou faixa em reais** (ou descreve o uso) que eu busco de novo, bem solto."
+     "Nao achei oferta boa nessa rodada — manda **modelo ou faixa em reais** (ou descreve o uso) que eu busco de novo, bem solto."
     )
-    return
+    return res.sendStatus(200)
    }
 
   }
@@ -1427,10 +1165,12 @@ app.post("/webhook",async(req,res)=>{
 
   res.sendStatus(200)
 
- } catch (e) {
-  console.error("[webhook] erro (usuario nao recebe msg):", e.message)
-  if (e.stack) console.error(e.stack)
-  if (!res.headersSent) res.sendStatus(200)
+ }catch(e){
+
+  console.log("Erro webhook:",e.message)
+
+  res.sendStatus(200)
+
  }
 
 })
@@ -1440,12 +1180,12 @@ async function runHardToBeatRoutine() {
   const rows = await db.getAllSessionsForCron()
   if (!rows.length) return
 
-  for (const row of rows) {
+  await Promise.all(rows.map(async (row) => {
    const query = await extractSearchQuery(row.context, { chatId: row.chat_id })
    const raw = await searchPhones(query)
    const phones = rankAndEnrichPhones(raw, parseQualifiers(row.qualifiers_json || "{}"))
    await savePriceSnapshot(row.chat_id, query, phones)
-  }
+  }))
 
   console.log(`[HARD_TO_BEAT] rotina concluida para ${rows.length} usuarios`)
  } catch (e) {
@@ -1458,12 +1198,12 @@ async function runMonitorTargetAlerts() {
   const today = todayKeySaoPaulo()
   const sessions = await db.getMonitorSessions(today)
 
-  for (const s of sessions) {
+  await Promise.all(sessions.map(async (s) => {
    const query = await extractSearchQuery(s.context || "", { chatId: s.chat_id })
    const raw = await searchPhones(query)
    const phones = rankAndEnrichPhones(raw, parseQualifiers(s.qualifiers_json || "{}"))
    const prices = phones.map((p) => p.price_numeric).filter((n) => n !== null && n > 0)
-   if (!prices.length) continue
+   if (!prices.length) return
    const minP = Math.min(...prices)
    const alvo = Number(s.monitor_target_brl)
    if (minP <= alvo) {
@@ -1473,7 +1213,7 @@ async function runMonitorTargetAlerts() {
     )
     await db.updateMonitorAlertSentOn(s.chat_id, today)
    }
-  }
+  }))
 
   if (sessions.length) console.log(`[MONITOR_ALERT] checados ${sessions.length} usuario(s) com alvo`)
  } catch (e) {
@@ -1494,8 +1234,7 @@ app.get("/api/cron", async (req, res) => {
   return res.status(401).json({ error: "Unauthorized" })
  }
  try {
-  await runHardToBeatRoutine()
-  await runMonitorTargetAlerts()
+  await Promise.all([runHardToBeatRoutine(), runMonitorTargetAlerts()])
   res.json({ ok: true })
  } catch (e) {
   console.log("[CRON] erro:", e.message)
@@ -1509,28 +1248,23 @@ SERVIDOR — local dev ou Vercel
 ========================================
 */
 
-// Só escuta quando este arquivo é o entrypoint (node index.js). Em Vercel, api/index.js faz require() — sem listen.
 if (require.main === module) {
- // Cron local: roda às 9h fuso São Paulo igual ao Vercel Cron
  cron.schedule(
   "0 9 * * *",
   async () => {
-   await runHardToBeatRoutine()
-   await runMonitorTargetAlerts()
+   await Promise.all([runHardToBeatRoutine(), runMonitorTargetAlerts()])
   },
   { timezone: "America/Sao_Paulo" }
  )
 
  if (process.env.RUN_HARD_TO_BEAT_ON_STARTUP === "true") {
-  runHardToBeatRoutine().then(() => runMonitorTargetAlerts())
+  Promise.all([runHardToBeatRoutine(), runMonitorTargetAlerts()])
  }
 
  app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`)
   console.log(`Log Telegram (navegador): http://localhost:${PORT}/logs`)
   if (LOG_VIEWER_SECRET) console.log("Log protegido: use /logs?key=...")
-  if (OPENAI_USE_AGENTS_FOR_CONCIERGE)
-   console.log("[config] Concierge via @openai/agents (Agent Builder). Desligar: OPENAI_USE_AGENTS_FOR_CONCIERGE=0")
  })
 }
 
